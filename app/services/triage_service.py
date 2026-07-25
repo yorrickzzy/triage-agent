@@ -62,12 +62,17 @@ class TriageService:
                 )
 
             elif gate_result.decision == "abstain":
-                result = TriageResult(
-                    action="abstain",
-                    rca=rca,
+                # Create abstain RCA with the gate's reason
+                abstain_rca = self._build_abstain_rca(gate_result.reason)
+                # Deliver the abstain message to PR/Slack so the user knows why we gave up
+                result = self._deliver_rca(
+                    evidence=evidence,
+                    rca=abstain_rca,
                     reason=gate_result.reason,
                     incident_id=incident.id,
                 )
+                # Mark the action as abstain (not delivered)
+                result.action = "abstain"
 
             else:
                 result = self._deliver_rca(
@@ -191,6 +196,30 @@ class TriageService:
                 "Investigate and quarantine the nondeterministic test "
                 "or dependency responsible for the intermittent failure."
             )
+            confirmed_rca["confidence"] = 1.0  # High confidence: rerun proved it
+
+            # Re-verify the flaky RCA before delivering
+            if not self.rca_pipeline.verifier.verify(confirmed_rca, evidence):
+                # If verifier fails, create a safe flaky RCA with no claims
+                # (to avoid any ungrounded statements)
+                print(
+                    "[triage] flaky RCA failed grounding, creating safe version",
+                    flush=True,
+                )
+                confirmed_rca = {
+                    "failure_class": "flaky",
+                    "summary": (
+                        "The test failed on the first attempt but passed on rerun "
+                        "without code changes. Confirmed as flaky."
+                    ),
+                    "claims": [],  # Empty claims = just the fact, no detailed evidence
+                    "suggested_next_step": (
+                        "Investigate and quarantine the nondeterministic test "
+                        "or dependency responsible for the intermittent failure."
+                    ),
+                    "confidence": 1.0,
+                    "abstained": False,
+                }
 
             return self._deliver_rca(
                 evidence=evidence,

@@ -5,12 +5,10 @@ class RCAPipeline:
         self.verifier = verifier
 
     def run(self, evidence) -> dict:
-        raw_log = evidence.logs[0]
-
         rca = self.reasoner.generate(evidence)
         rca = self.classifier.normalize(rca)
 
-        if self.verifier.verify(rca, raw_log):
+        if self.verifier.verify(rca, evidence):
             return rca
 
         print("[pipeline] grounding failed, regenerating once...", flush=True)
@@ -20,7 +18,7 @@ class RCAPipeline:
             strict_grounding=True,
         )
 
-        if self.verifier.verify(rca, raw_log):
+        if self.verifier.verify(rca, evidence):
             return rca
 
         print("[pipeline] grounding failed again, abstaining", flush=True)

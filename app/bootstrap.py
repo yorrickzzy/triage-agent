@@ -1,6 +1,7 @@
 from app.core.database import SessionLocal, create_tables
 from app.services.github_client import GitHubClient
 from app.services.evidence_collector import EvidenceCollector
+from app.services.redactor import Redactor
 from app.services.openai_reasoner import OpenAIReasoner
 from app.services.failure_classifier import FailureClassifier
 from app.services.grounding_verifier import GroundingVerifier
@@ -24,7 +25,8 @@ def build_triage_service() -> TriageService:
     """
 
     github_client = GitHubClient()
-    evidence_collector = EvidenceCollector(github_client)
+    redactor = Redactor()
+    evidence_collector = EvidenceCollector(github_client, redactor=redactor)
 
     reasoner = OpenAIReasoner()
     classifier = FailureClassifier()
