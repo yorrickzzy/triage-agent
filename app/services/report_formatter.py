@@ -145,6 +145,7 @@ _Your feedback helps improve the CI/CD Triage Agent._
         rca: dict,
         incident_id: int,
         comment_url: str | None = None,
+        reference_url: str | None = None,
     ) -> str:
         failure_class = rca.get("failure_class", "unknown")
         summary = rca.get("summary", "No summary was generated.")
@@ -167,6 +168,11 @@ _Your feedback helps improve the CI/CD Triage Agent._
             lines.extend([
                 "",
                 f"*Full cited report:* {comment_url}",
+            ])
+        elif reference_url:
+            lines.extend([
+                "",
+                f"*Reference:* {reference_url}",
             ])
 
         lines.extend([

@@ -229,3 +229,30 @@ class GitHubClient:
         )
 
         return response.json()
+
+    def post_commit_comment(
+        self,
+        sha: str,
+        body: str,
+    ) -> dict:
+        if not sha.strip():
+            raise ValueError("Commit sha cannot be empty")
+
+        if not body.strip():
+            raise ValueError("Comment body cannot be empty")
+
+        response = self._post(
+            f"/commits/{sha}/comments",
+            json_body={"body": body},
+        )
+
+        return response.json()
+
+    def build_commit_url(self, sha: str) -> str:
+        return f"https://github.com/{self.owner}/{self.repo}/commit/{sha}"
+
+    def build_run_url(self, run_id: int) -> str:
+        return (
+            f"https://github.com/{self.owner}/{self.repo}"
+            f"/actions/runs/{run_id}"
+        )

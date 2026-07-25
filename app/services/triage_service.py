@@ -129,6 +129,7 @@ class TriageService:
         )
 
         comment_url = None
+        reference_url = self.github_client.build_run_url(evidence.run_id)
 
         if evidence.pull_request_number is not None:
             delivery_result = self.github_delivery.deliver(
@@ -141,12 +142,29 @@ class TriageService:
                 or delivery_result.get("url")
                 or None
             )
+            if comment_url:
+                reference_url = comment_url
+        else:
+            delivery_result = self.github_delivery.deliver_commit_comment(
+                sha=evidence.sha,
+                markdown=markdown,
+            )
+            comment_url = (
+                delivery_result.get("html_url")
+                or delivery_result.get("url")
+                or None
+            )
+            if comment_url:
+                reference_url = comment_url
+            else:
+                reference_url = self.github_client.build_commit_url(evidence.sha)
 
         slack_message = self.report_formatter.to_slack(
             evidence=evidence,
             rca=rca,
             incident_id=incident_id,
             comment_url=comment_url,
+            reference_url=reference_url,
         )
 
         self.slack_client.send_message(slack_message)
