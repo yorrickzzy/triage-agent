@@ -4,8 +4,11 @@ class RCAPipeline:
         self.classifier = classifier
         self.verifier = verifier
 
-    def run(self, evidence) -> dict:
-        rca = self.reasoner.generate(evidence)
+    def run(self, evidence, rag_context: list[dict] | None = None) -> dict:
+        rca = self.reasoner.generate(
+            evidence,
+            rag_context=rag_context,
+        )
         rca = self.classifier.normalize(rca)
 
         if self.verifier.verify(rca, evidence):
@@ -15,6 +18,7 @@ class RCAPipeline:
 
         rca = self.reasoner.generate(
             evidence,
+            rag_context=rag_context,
             strict_grounding=True,
         )
 

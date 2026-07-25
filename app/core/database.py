@@ -39,5 +39,6 @@ def create_tables() -> None:
     # 必须先导入模型，SQLAlchemy 才知道有哪些表
     from app.models.feedback import Feedback  # noqa: F401
     from app.models.incident import Incident  # noqa: F401
+    from app.models.rag_chunk import RagChunk  # noqa: F401
 
     Base.metadata.create_all(bind=engine)

@@ -29,7 +29,8 @@ class TriageService:
         report_formatter,
         github_delivery,
         slack_client,
-        incident_store
+        incident_store,
+        rag_store=None,
     ):
         self.evidence_collector = evidence_collector
         self.rca_pipeline = rca_pipeline
@@ -39,18 +40,29 @@ class TriageService:
         self.github_delivery = github_delivery
         self.slack_client = slack_client
         self.incident_store = incident_store
+        self.rag_store = rag_store
 
     
 
     def triage(self, run_id: int) -> TriageResult:
         evidence = self.evidence_collector.collect(run_id)
-        rca = self.rca_pipeline.run(evidence)
+        rag_context = []
+        if self.rag_store is not None:
+            rag_context = self.rag_store.retrieve_for_evidence(evidence)
+
+        rca = self.rca_pipeline.run(
+            evidence,
+            rag_context=rag_context,
+        )
         gate_result = self.confidence_gate.evaluate(rca)
 
         incident = self.incident_store.create_incident(
             evidence=evidence,
             rca=rca,
         )
+
+        if self.rag_store is not None:
+            self.rag_store.index_incident(incident)
 
         try:
             if gate_result.decision == "rerun":

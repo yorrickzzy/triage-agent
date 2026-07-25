@@ -24,8 +24,36 @@ class OpenAIReasoner:
             for i, line in enumerate(raw_log.lines)
         )
 
-    def generate(self, evidence, strict_grounding: bool = False) -> dict:
+    def _format_rag_context(
+        self,
+        rag_context: list[dict] | None,
+    ) -> str:
+        if not rag_context:
+            return "None"
+
+        lines = []
+        for idx, chunk in enumerate(rag_context, start=1):
+            lines.append(
+                (
+                    f"{idx}. "
+                    f"source={chunk.get('source_type')}#{chunk.get('source_id')}; "
+                    f"workflow={chunk.get('workflow_name')}; "
+                    f"class={chunk.get('failure_class')}; "
+                    f"quality={chunk.get('quality_score', 0.0):.2f}\n"
+                    f"{chunk.get('text', '')}"
+                )
+            )
+
+        return "\n\n".join(lines)
+
+    def generate(
+        self,
+        evidence,
+        rag_context: list[dict] | None = None,
+        strict_grounding: bool = False,
+    ) -> dict:
         log_text = self._format_log_with_line_numbers(evidence.logs[0])
+        rag_text = self._format_rag_context(rag_context)
 
         strict_instruction = ""
         if strict_grounding:
@@ -34,6 +62,7 @@ class OpenAIReasoner:
         Your previous answer failed grounding verification.
         Cite only exact text copied from the numbered logs.
         Do not cite the diff.
+        Do not cite historical context.
         Do not paraphrase quotes.
         Every quote must appear verbatim in the cited log line range.
         If you cannot ground the answer, set abstained=true.
@@ -75,6 +104,9 @@ Last green run id: {evidence.last_green_run_id}
 
 Diff:
 {evidence.diff}
+
+Historical context (for hints only; never cite this as evidence):
+{rag_text}
 
 Logs:
 {log_text}

@@ -12,6 +12,7 @@ from app.services.github_delivery import GitHubDelivery
 from app.services.triage_service import TriageService
 from app.services.slack_client import SlackClient
 from app.services.incident_store import IncidentStore
+from app.services.rag_store import RagStore
 
 
 def build_triage_service() -> TriageService:
@@ -43,6 +44,7 @@ def build_triage_service() -> TriageService:
     github_delivery = GitHubDelivery(github_client)
     slack_client = SlackClient()
     incident_store = IncidentStore(SessionLocal)
+    rag_store = RagStore(SessionLocal)
 
     return TriageService(
         evidence_collector=evidence_collector,
@@ -53,4 +55,5 @@ def build_triage_service() -> TriageService:
         github_delivery=github_delivery,
         slack_client=slack_client,
         incident_store=incident_store,
+        rag_store=rag_store,
     )

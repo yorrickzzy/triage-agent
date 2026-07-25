@@ -13,6 +13,7 @@ from app.services.feedback_store import (
     FeedbackStore,
     IncidentNotFoundError,
 )
+from app.services.rag_store import RagStore
 
 
 router = APIRouter(
@@ -21,6 +22,7 @@ router = APIRouter(
 )
 
 feedback_store = FeedbackStore(SessionLocal)
+rag_store = RagStore(SessionLocal)
 
 
 @router.post(
@@ -33,6 +35,10 @@ def create_feedback(
 ) -> FeedbackResponse:
     try:
         feedback = feedback_store.create_feedback(request)
+        rag_store.apply_feedback(
+            incident_id=feedback.incident_id,
+            verdict=feedback.verdict,
+        )
         return FeedbackResponse.model_validate(feedback)
 
     except IncidentNotFoundError as exc:
@@ -55,6 +61,10 @@ def capture_feedback(
             incident_id=incident_id,
             verdict=verdict,
             reviewer="report-link",
+        )
+        rag_store.apply_feedback(
+            incident_id=feedback.incident_id,
+            verdict=feedback.verdict,
         )
 
     except IncidentNotFoundError as exc:
