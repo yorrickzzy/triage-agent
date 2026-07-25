@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: chamber-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: chamber
+      POSTGRES_PASSWORD: chamber_password
+      POSTGRES_DB: chamber
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - chamber_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U chamber -d chamber"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    image: triage-agent:local
+    container_name: chamber-agent
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      DATABASE_URL: postgresql+psycopg://chamber:chamber_password@postgres:5432/chamber
+
+    ports:
+      - "8000:8000"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  chamber_postgres_data:
