@@ -1,6 +1,6 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.core.config import DATABASE_URL
@@ -42,3 +42,13 @@ def create_tables() -> None:
     from app.models.rag_chunk import RagChunk  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
+
+    # Backward-compatible migration for existing databases:
+    # keep a nullable embedding column available for RAG metadata.
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE rag_chunks "
+                "ADD COLUMN IF NOT EXISTS embedding TEXT"
+            )
+        )

@@ -24,3 +24,8 @@ APP_BASE_URL = os.getenv(
 ).rstrip("/")
 
 RCA_CONFIDENCE_THRESHOLD = float(os.getenv("RCA_CONFIDENCE_THRESHOLD", 0.8))
+
+ENABLE_PGVECTOR = (
+    os.getenv("ENABLE_PGVECTOR", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)

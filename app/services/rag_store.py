@@ -5,6 +5,7 @@ import re
 from sqlalchemy import desc, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.core.config import ENABLE_PGVECTOR
 from app.models.rag_chunk import RagChunk
 
 try:
@@ -38,7 +39,7 @@ class RagStore:
         return [value / norm for value in vector]
 
     def _serialize_embedding(self, embedding: list[float]) -> str | list[float]:
-        if Vector is None:
+        if not ENABLE_PGVECTOR or Vector is None:
             return json.dumps(embedding)
 
         return embedding
@@ -121,7 +122,7 @@ class RagStore:
         return " ".join(part for part in parts if part)
 
     def _try_vector_retrieve(self, session: Session, evidence, limit: int) -> list[dict] | None:
-        if Vector is None:
+        if not ENABLE_PGVECTOR or Vector is None:
             return None
 
         query_text = self._build_query_text(evidence)

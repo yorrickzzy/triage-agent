@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy import BigInteger, DateTime, Float, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.core.config import ENABLE_PGVECTOR
 from app.core.database import Base
 
 try:
@@ -55,7 +56,7 @@ class RagChunk(Base):
         default=0.0,
     )
 
-    if Vector is not None:
+    if ENABLE_PGVECTOR and Vector is not None:
         embedding: Mapped[list[float] | None] = mapped_column(
             Vector(32),
             nullable=True,
