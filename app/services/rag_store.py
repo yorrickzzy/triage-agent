@@ -163,6 +163,8 @@ class RagStore:
             ]
         except Exception as exc:  # pragma: no cover - depends on DB extension availability
             print(f"[rag] vector search unavailable, falling back to SQL: {exc}", flush=True)
+            # Reset failed transaction state before running SQL fallback queries.
+            session.rollback()
             return None
 
     def _sql_fallback_retrieve(self, session: Session, evidence, limit: int) -> list[dict]:
