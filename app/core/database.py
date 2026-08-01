@@ -3,7 +3,7 @@ from collections.abc import Generator
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-from app.core.config import DATABASE_URL
+from app.core.config import DATABASE_URL, ENABLE_PGVECTOR
 
 
 if not DATABASE_URL:
@@ -43,12 +43,37 @@ def create_tables() -> None:
 
     Base.metadata.create_all(bind=engine)
 
-    # Backward-compatible migration for existing databases:
-    # keep a nullable embedding column available for RAG metadata.
     with engine.begin() as conn:
-        conn.execute(
-            text(
-                "ALTER TABLE rag_chunks "
-                "ADD COLUMN IF NOT EXISTS embedding TEXT"
+        if ENABLE_PGVECTOR:
+            # Provision pgvector mode when explicitly enabled.
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+
+            # Ensure the embedding column exists first.
+            conn.execute(
+                text(
+                    "ALTER TABLE rag_chunks "
+                    "ADD COLUMN IF NOT EXISTS embedding TEXT"
+                )
             )
-        )
+
+            # Convert text/json-string embeddings into vector values.
+            conn.execute(
+                text(
+                    """
+                    ALTER TABLE rag_chunks
+                    ALTER COLUMN embedding TYPE vector(32)
+                    USING CASE
+                      WHEN embedding IS NULL OR btrim(embedding::text) = '' THEN NULL
+                      ELSE embedding::vector(32)
+                    END
+                    """
+                )
+            )
+        else:
+            # Backward-compatible fallback without pgvector.
+            conn.execute(
+                text(
+                    "ALTER TABLE rag_chunks "
+                    "ADD COLUMN IF NOT EXISTS embedding TEXT"
+                )
+            )
