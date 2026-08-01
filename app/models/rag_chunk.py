@@ -5,6 +5,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.database import Base
 
+try:
+    from pgvector.sqlalchemy import Vector  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    Vector = None
+
 
 class RagChunk(Base):
     __tablename__ = "rag_chunks"
@@ -49,6 +54,17 @@ class RagChunk(Base):
         nullable=False,
         default=0.0,
     )
+
+    if Vector is not None:
+        embedding: Mapped[list[float] | None] = mapped_column(
+            Vector(32),
+            nullable=True,
+        )
+    else:
+        embedding: Mapped[str | None] = mapped_column(
+            Text,
+            nullable=True,
+        )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -1,0 +1,34 @@
+{
+  "samples": [
+    {
+      "run_id": 1234567890,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "Incorrect test assertion in tests/test_calculator.py",
+      "ambiguous": false,
+      "note": "Replace with a real local snapshot",
+      "evidence": {
+        "run_id": 1234567890,
+        "workflow_name": "CI",
+        "branch": "feature/example",
+        "sha": "abcdef1234567890",
+        "failed_jobs": ["test"],
+        "diff": "diff --git a/tests/test_calculator.py b/tests/test_calculator.py",
+        "last_green_run_id": 1234567888,
+        "pull_request_number": 42,
+        "logs": [
+          {
+            "job_id": 111,
+            "job_name": "test",
+            "text": "tests/test_calculator.py F\nE assert 200 == 30\nFAILED tests/test_calculator.py::test_multiply",
+            "lines": [
+              "tests/test_calculator.py F",
+              "E assert 200 == 30",
+              "FAILED tests/test_calculator.py::test_multiply"
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}
