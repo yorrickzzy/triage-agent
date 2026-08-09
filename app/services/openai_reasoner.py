@@ -903,12 +903,16 @@ Previous tool observations:
 
             if tool_name == "get_failed_logs":
                 log_rows = tool_result.get("result") or []
-                if isinstance(log_rows, list) and len(log_rows) > 0:
+                if isinstance(log_rows, list):
+                    # A successful log fetch attempt satisfies the evidence step,
+                    # even when no failed logs are returned.
                     has_log_evidence = True
 
             if tool_name == "search_playbook":
                 chunks = (tool_result.get("result") or {}).get("chunks") or []
-                if isinstance(chunks, list) and len(chunks) > 0:
+                if isinstance(chunks, list):
+                    # Historical retrieval can legitimately return zero matches.
+                    # Treating this as "missing evidence" causes avoidable abstains.
                     has_rag_evidence = True
 
         observations.append(
