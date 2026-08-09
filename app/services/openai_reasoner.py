@@ -7,7 +7,7 @@ from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
 
 
 class OpenAIReasoner:
-    MAX_REASONING_TURNS = 3
+    MAX_REASONING_TURNS = 4
     CONTROLLED_AGENT_MODE = True
     LOGS_BUDGET_CHARS = 10000
     DIFF_BUDGET_CHARS = 2500
@@ -328,6 +328,10 @@ Hard constraints:
   1) log evidence via get_failed_logs
   2) historical evidence via search_playbook
 - If either evidence source is missing, request a tool call instead of final.
+- Call-order guidance:
+    1) If log evidence is missing, call get_failed_logs first.
+    2) If log evidence exists but historical evidence is missing, call search_playbook next.
+    3) Once both evidence requirements are satisfied, return final RCA immediately.
 - Never cite diff or historical context as primary evidence claims.
 
 Available tools:
