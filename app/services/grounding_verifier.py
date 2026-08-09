@@ -3,6 +3,8 @@ import re
 TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T.*?Z\s+"
 )
+# Strips "123 | " line-number prefix the model copies from numbered log output.
+LINE_NUMBER_PREFIX = re.compile(r"^\d+\s*\|\s*")
 
 class GroundingVerifier:
 
@@ -10,7 +12,7 @@ class GroundingVerifier:
         lines = []
 
         for line in text.splitlines():
-            # 去掉 GitHub Actions 前面的时间戳
+            line = LINE_NUMBER_PREFIX.sub("", line)
             line = TIMESTAMP_PATTERN.sub("", line)
             lines.append(line.rstrip())
 
