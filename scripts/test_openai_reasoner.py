@@ -481,6 +481,64 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         self.assertEqual(reasoner.tools.get_failed_logs.call_count, 1)
         self.assertEqual(reasoner.tools.search_playbook.call_count, 1)
 
+    def test_controlled_mode_forces_current_run_id_for_get_failed_logs(self):
+        reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+        reasoner.client = Mock()
+        reasoner.tools = Mock()
+        reasoner.controlled_agent_mode = True
+        reasoner.max_reasoning_turns = 4
+        reasoner.OBSERVATIONS_BUDGET_CHARS = 4000
+
+        reasoner.tools.get_failed_logs.return_value = [
+            RawLog(
+                job_id=20,
+                job_name="unit-tests",
+                text="AssertionError",
+                lines=["AssertionError"],
+            )
+        ]
+        reasoner.tools.search_playbook.return_value = []
+
+        reasoner.client.responses.create.side_effect = [
+            SimpleNamespace(
+                output_text=(
+                    '{"action":"tool_call","tool":"get_failed_logs",'
+                    '"args":{"run_id":29178292575},"reason":"need logs"}'
+                )
+            ),
+            SimpleNamespace(
+                output_text=(
+                    '{"action":"tool_call","tool":"search_playbook",'
+                    '"args":{"query":"ci unit-tests","limit":5},'
+                    '"reason":"check historical matches"}'
+                )
+            ),
+            SimpleNamespace(
+                output_text=(
+                    '{"action":"final","rca":'
+                    '{"failure_class":"test","summary":"s",'
+                    '"claims":[],"suggested_next_step":"n",'
+                    '"confidence":0.9,"abstained":false}}'
+                )
+            ),
+        ]
+
+        evidence = SimpleNamespace(
+            run_id=31307072970,
+            workflow_name="ci",
+            branch="main",
+            sha="abc123",
+            failed_jobs=["unit-tests"],
+            last_green_run_id=12,
+            diff="",
+            logs=[],
+        )
+
+        result = reasoner.generate(evidence)
+
+        self.assertFalse(result["abstained"])
+        reasoner.tools.get_failed_logs.assert_called_once_with(31307072970)
+
 
 if __name__ == "__main__":
     unittest.main()

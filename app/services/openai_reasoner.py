@@ -876,6 +876,16 @@ Previous tool observations:
                 )
 
             tool_name = payload.get("tool")
+            if tool_name == "get_failed_logs":
+                # In controlled mode, logs must come from the current failing run.
+                # Ignore model-provided run IDs to avoid cross-run contamination.
+                payload = {
+                    **payload,
+                    "args": {
+                        **(payload.get("args") or {}),
+                        "run_id": evidence.run_id,
+                    },
+                }
             tool_result = self._execute_tool_call(evidence, payload)
             observations.append(
                 {
