@@ -150,7 +150,7 @@ class RagStore:
                 FROM rag_chunks
                 WHERE (:source_type IS NULL OR source_type = :source_type)
                   AND (:workflow_name IS NULL OR workflow_name = :workflow_name)
-                ORDER BY embedding <-> CAST(:embedding AS vector(32)) DESC,
+                                ORDER BY embedding <-> CAST(:embedding AS vector(32)) ASC,
                          quality_score DESC,
                          created_at DESC
                 LIMIT :limit

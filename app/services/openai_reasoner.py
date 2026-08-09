@@ -221,6 +221,31 @@ class OpenAIReasoner:
         enriched["reasoning_trace"] = list(observations)
         return enriched
 
+    def _build_prefetch_observation(
+        self,
+        *,
+        evidence,
+        input_context: list[dict] | None,
+        merged_context: list[dict] | None,
+    ) -> dict | None:
+        query = self._build_tool_query(evidence)
+        input_count = len(input_context or [])
+        merged_count = len(merged_context or [])
+        added_count = max(0, merged_count - input_count)
+
+        if self.tools is None and input_count == 0:
+            return None
+
+        return {
+            "event": "prefetch_rag_context",
+            "toolbelt_configured": self.tools is not None,
+            "query": query,
+            "input_context_count": input_count,
+            "output_context_count": merged_count,
+            "added_context_count": added_count,
+            "source": "triage_service.retrieve_for_evidence + reasoner._collect_tool_context",
+        }
+
     def _execute_tool_call(self, evidence, payload: dict) -> dict:
         if self.tools is None:
             return {
@@ -464,6 +489,11 @@ Previous tool observations:
         strict_grounding: bool = False,
     ) -> dict:
         merged_rag_context = self._collect_tool_context(evidence, rag_context)
+        prefetch_observation = self._build_prefetch_observation(
+            evidence=evidence,
+            input_context=rag_context,
+            merged_context=merged_rag_context,
+        )
         raw_log_text, logs_windowed = self._format_logs(evidence.logs)
         log_text, logs_budget_truncated = self._truncate_text(
             raw_log_text,
@@ -490,6 +520,8 @@ Previous tool observations:
         try:
             current_context = list(merged_rag_context or [])
             observations: list[dict] = []
+            if prefetch_observation is not None:
+                observations.append(prefetch_observation)
 
             for _ in range(self.max_reasoning_turns):
                 rag_raw = self._format_rag_context(current_context)
