@@ -8,6 +8,7 @@ from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
 
 class OpenAIReasoner:
     MAX_REASONING_TURNS = 3
+    CONTROLLED_AGENT_MODE = True
     LOGS_BUDGET_CHARS = 10000
     DIFF_BUDGET_CHARS = 2500
     RAG_BUDGET_CHARS = 2500
@@ -20,6 +21,7 @@ class OpenAIReasoner:
         self.client = OpenAI(api_key=OPENAI_API_KEY)
         self.tools = tools
         self.max_reasoning_turns = self.MAX_REASONING_TURNS
+        self.controlled_agent_mode = self.CONTROLLED_AGENT_MODE
 
     def _fallback_result(self, error: Exception) -> dict:
         return {
@@ -220,6 +222,137 @@ class OpenAIReasoner:
         enriched = dict(rca)
         enriched["reasoning_trace"] = list(observations)
         return enriched
+
+    def _prepend_reasoning_trace(
+        self,
+        rca: dict,
+        observations: list[dict],
+    ) -> dict:
+        if not observations:
+            return rca
+
+        enriched = dict(rca)
+        existing = enriched.get("reasoning_trace")
+        if isinstance(existing, list):
+            enriched["reasoning_trace"] = list(observations) + list(existing)
+        else:
+            enriched["reasoning_trace"] = list(observations)
+
+        return enriched
+
+    def _is_evidence_tool(self, tool_name: str | None) -> bool:
+        return tool_name in {"get_failed_logs", "search_playbook"}
+
+    def _has_required_evidence(
+        self,
+        *,
+        has_log_evidence: bool,
+        has_rag_evidence: bool,
+        evidence_tool_calls: int,
+    ) -> bool:
+        return (
+            evidence_tool_calls >= 1
+            and has_log_evidence
+            and has_rag_evidence
+        )
+
+    def _controlled_abstain_result(
+        self,
+        *,
+        summary: str,
+        observations: list[dict],
+    ) -> dict:
+        return {
+            "failure_class": "unknown",
+            "summary": summary,
+            "claims": [],
+            "suggested_next_step": "A human should inspect this CI failure manually.",
+            "confidence": 0.0,
+            "abstained": True,
+            "reasoning_trace": list(observations),
+        }
+
+    def _build_controlled_loop_prompt(
+        self,
+        *,
+        evidence,
+        strict_instruction: str,
+        observations_text: str,
+        observations_truncated: bool,
+        has_log_evidence: bool,
+        has_rag_evidence: bool,
+        evidence_tool_calls: int,
+    ) -> str:
+        return f"""
+You are a CI/CD triage agent running in controlled tool-first mode.
+
+{strict_instruction}
+
+You may reason in multiple turns. Return ONLY valid JSON in one of these forms:
+
+1) Request a tool call
+{{
+    "action": "tool_call",
+    "tool": "get_failed_logs|get_commit_diff|get_last_green_run|rerun_job|search_playbook",
+    "args": {{ ... }},
+    "reason": "..."
+}}
+
+2) Return final RCA
+{{
+    "action": "final",
+    "rca": {{
+        "failure_class": "lint|format|test|build|dependency|flaky",
+        "summary": "...",
+        "claims": [
+            {{
+                "statement": "...",
+                "citations": [
+                    {{
+                        "line_start": 1,
+                        "line_end": 1,
+                        "quote": "exact quote from logs"
+                    }}
+                ]
+            }}
+        ],
+        "suggested_next_step": "...",
+        "confidence": 0.0,
+        "abstained": false
+    }}
+}}
+
+Hard constraints:
+- At most one tool call per turn.
+- Before returning final RCA, you must gather BOTH:
+  1) log evidence via get_failed_logs
+  2) historical evidence via search_playbook
+- If either evidence source is missing, request a tool call instead of final.
+- Never cite diff or historical context as primary evidence claims.
+
+Available tools:
+- get_failed_logs(run_id)
+- get_commit_diff(sha)
+- get_last_green_run(workflow_id, branch, current_run_id)
+- rerun_job(run_id)
+- search_playbook(query, limit)
+
+Task metadata:
+Workflow: {evidence.workflow_name}
+Branch: {evidence.branch}
+SHA: {evidence.sha}
+Failed jobs: {evidence.failed_jobs}
+Last green run id: {evidence.last_green_run_id}
+
+Evidence status:
+- log_evidence_ready: {str(has_log_evidence).lower()}
+- historical_evidence_ready: {str(has_rag_evidence).lower()}
+- evidence_tool_calls: {evidence_tool_calls}
+- observations_truncated: {str(observations_truncated).lower()}
+
+Tool observations (the only detailed context you currently have):
+{observations_text}
+"""
 
     def _build_prefetch_observation(
         self,
@@ -482,11 +615,11 @@ Previous tool observations:
             print(f"[reasoner] tool context unavailable: {exc}", flush=True)
             return rag_context
 
-    def generate(
+    def _generate_workflow_mode(
         self,
         evidence,
-        rag_context: list[dict] | None = None,
-        strict_grounding: bool = False,
+        rag_context: list[dict] | None,
+        strict_grounding: bool,
     ) -> dict:
         merged_rag_context = self._collect_tool_context(evidence, rag_context)
         prefetch_observation = self._build_prefetch_observation(
@@ -517,94 +650,301 @@ Previous tool observations:
         If you cannot ground the answer, set abstained=true.
         """
 
-        try:
-            current_context = list(merged_rag_context or [])
-            observations: list[dict] = []
-            if prefetch_observation is not None:
-                observations.append(prefetch_observation)
+        current_context = list(merged_rag_context or [])
+        observations: list[dict] = []
+        if prefetch_observation is not None:
+            observations.append(prefetch_observation)
 
-            for _ in range(self.max_reasoning_turns):
-                rag_raw = self._format_rag_context(current_context)
-                rag_text, rag_truncated = self._truncate_text(
-                    rag_raw,
-                    self.RAG_BUDGET_CHARS,
+        for _ in range(self.max_reasoning_turns):
+            rag_raw = self._format_rag_context(current_context)
+            rag_text, rag_truncated = self._truncate_text(
+                rag_raw,
+                self.RAG_BUDGET_CHARS,
+            )
+
+            observations_raw = "None"
+            if observations:
+                observations_raw = json.dumps(
+                    observations,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            observations_text, observations_truncated = self._truncate_text(
+                observations_raw,
+                self.OBSERVATIONS_BUDGET_CHARS,
+            )
+
+            truncation_status = {
+                "logs_truncated": logs_windowed or logs_budget_truncated,
+                "diff_truncated": diff_truncated,
+                "rag_truncated": rag_truncated,
+                "observations_truncated": observations_truncated,
+            }
+
+            prompt = self._build_loop_prompt(
+                evidence=evidence,
+                diff_text=diff_text,
+                rag_text=rag_text,
+                log_text=log_text,
+                strict_instruction=strict_instruction,
+                observations_text=observations_text,
+                truncation_status=truncation_status,
+            )
+
+            response = self.client.responses.create(
+                model=OPENAI_MODEL,
+                input=prompt,
+            )
+            payload = json.loads(response.output_text)
+
+            # Backward compatibility: allow direct RCA output without action wrapper.
+            if self._is_rca_payload(payload):
+                return self._with_reasoning_trace(payload, observations)
+
+            action = payload.get("action")
+            if action == "final" and self._is_rca_payload(payload.get("rca")):
+                return self._with_reasoning_trace(payload["rca"], observations)
+
+            if action != "tool_call":
+                return self._fallback_result(
+                    ValueError(f"Invalid reasoner action: {action}")
                 )
 
-                observations_raw = "None"
-                if observations:
-                    observations_raw = json.dumps(
-                        observations,
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                observations_text, observations_truncated = self._truncate_text(
-                    observations_raw,
-                    self.OBSERVATIONS_BUDGET_CHARS,
-                )
-
-                truncation_status = {
-                    "logs_truncated": logs_windowed or logs_budget_truncated,
-                    "diff_truncated": diff_truncated,
-                    "rag_truncated": rag_truncated,
-                    "observations_truncated": observations_truncated,
+            tool_result = self._execute_tool_call(evidence, payload)
+            observations.append(
+                {
+                    "tool_request": {
+                        "tool": payload.get("tool"),
+                        "args": payload.get("args") or {},
+                        "reason": payload.get("reason", ""),
+                    },
+                    "tool_result": tool_result,
                 }
+            )
 
-                prompt = self._build_loop_prompt(
-                    evidence=evidence,
-                    diff_text=diff_text,
-                    rag_text=rag_text,
-                    log_text=log_text,
-                    strict_instruction=strict_instruction,
-                    observations_text=observations_text,
-                    truncation_status=truncation_status,
+            if tool_result.get("ok") and payload.get("tool") == "search_playbook":
+                current_context = self._merge_rag_context(
+                    current_context,
+                    (tool_result.get("result") or {}).get("chunks") or [],
                 )
 
-                response = self.client.responses.create(
-                    model=OPENAI_MODEL,
-                    input=prompt,
-                )
-                payload = json.loads(response.output_text)
+        return {
+            "failure_class": "unknown",
+            "summary": "Reasoner did not return a final RCA within the turn limit.",
+            "claims": [],
+            "suggested_next_step": "A human should inspect this CI failure manually.",
+            "confidence": 0.0,
+            "abstained": True,
+            "reasoning_trace": observations,
+        }
 
-                # Backward compatibility: allow direct RCA output without action wrapper.
-                if self._is_rca_payload(payload):
+    def _generate_controlled_agent_mode(
+        self,
+        evidence,
+        strict_grounding: bool,
+        rag_context: list[dict] | None,
+    ) -> dict:
+        if self.tools is None:
+            return self._controlled_abstain_result(
+                summary=(
+                    "Controlled mode requires a configured toolbelt, "
+                    "but no tools are available."
+                ),
+                observations=[
+                    {
+                        "event": "controlled_mode_abstain",
+                        "reason": "toolbelt_not_configured",
+                    }
+                ],
+            )
+
+        strict_instruction = ""
+        if strict_grounding:
+            strict_instruction = """
+        IMPORTANT:
+        Your previous answer failed grounding verification.
+        You must gather log evidence and historical evidence through tools before final output.
+        Cite only exact text copied from numbered logs.
+        """
+
+        observations: list[dict] = []
+        has_log_evidence = False
+        has_rag_evidence = False
+        evidence_tool_calls = 0
+
+        for _ in range(self.max_reasoning_turns):
+            observations_raw = "None"
+            if observations:
+                observations_raw = json.dumps(
+                    observations,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            observations_text, observations_truncated = self._truncate_text(
+                observations_raw,
+                self.OBSERVATIONS_BUDGET_CHARS,
+            )
+
+            prompt = self._build_controlled_loop_prompt(
+                evidence=evidence,
+                strict_instruction=strict_instruction,
+                observations_text=observations_text,
+                observations_truncated=observations_truncated,
+                has_log_evidence=has_log_evidence,
+                has_rag_evidence=has_rag_evidence,
+                evidence_tool_calls=evidence_tool_calls,
+            )
+
+            response = self.client.responses.create(
+                model=OPENAI_MODEL,
+                input=prompt,
+            )
+            payload = json.loads(response.output_text)
+
+            # Backward compatibility: direct RCA payload is treated as final action.
+            if self._is_rca_payload(payload):
+                if self._has_required_evidence(
+                    has_log_evidence=has_log_evidence,
+                    has_rag_evidence=has_rag_evidence,
+                    evidence_tool_calls=evidence_tool_calls,
+                ):
                     return self._with_reasoning_trace(payload, observations)
 
-                action = payload.get("action")
-                if action == "final" and self._is_rca_payload(payload.get("rca")):
-                    return self._with_reasoning_trace(payload["rca"], observations)
-
-                if action != "tool_call":
-                    return self._fallback_result(
-                        ValueError(f"Invalid reasoner action: {action}")
-                    )
-
-                tool_result = self._execute_tool_call(evidence, payload)
                 observations.append(
                     {
-                        "tool_request": {
-                            "tool": payload.get("tool"),
-                            "args": payload.get("args") or {},
-                            "reason": payload.get("reason", ""),
+                        "event": "final_blocked",
+                        "reason": "missing_required_evidence",
+                        "required": {
+                            "has_log_evidence": True,
+                            "has_rag_evidence": True,
+                            "evidence_tool_calls_min": 1,
                         },
-                        "tool_result": tool_result,
+                        "current": {
+                            "has_log_evidence": has_log_evidence,
+                            "has_rag_evidence": has_rag_evidence,
+                            "evidence_tool_calls": evidence_tool_calls,
+                        },
                     }
                 )
+                continue
 
-                if tool_result.get("ok") and payload.get("tool") == "search_playbook":
-                    current_context = self._merge_rag_context(
-                        current_context,
-                        (tool_result.get("result") or {}).get("chunks") or [],
-                    )
+            action = payload.get("action")
+            if action == "final" and self._is_rca_payload(payload.get("rca")):
+                if self._has_required_evidence(
+                    has_log_evidence=has_log_evidence,
+                    has_rag_evidence=has_rag_evidence,
+                    evidence_tool_calls=evidence_tool_calls,
+                ):
+                    return self._with_reasoning_trace(payload["rca"], observations)
 
-            return {
-                "failure_class": "unknown",
-                "summary": "Reasoner did not return a final RCA within the turn limit.",
-                "claims": [],
-                "suggested_next_step": "A human should inspect this CI failure manually.",
-                "confidence": 0.0,
-                "abstained": True,
-                "reasoning_trace": observations,
+                observations.append(
+                    {
+                        "event": "final_blocked",
+                        "reason": "missing_required_evidence",
+                        "required": {
+                            "has_log_evidence": True,
+                            "has_rag_evidence": True,
+                            "evidence_tool_calls_min": 1,
+                        },
+                        "current": {
+                            "has_log_evidence": has_log_evidence,
+                            "has_rag_evidence": has_rag_evidence,
+                            "evidence_tool_calls": evidence_tool_calls,
+                        },
+                    }
+                )
+                continue
+
+            if action != "tool_call":
+                observations.append(
+                    {
+                        "event": "controlled_mode_abstain",
+                        "reason": f"invalid_action:{action}",
+                    }
+                )
+                return self._controlled_abstain_result(
+                    summary=(
+                        "Controlled mode received an invalid model action "
+                        "before evidence requirements were met."
+                    ),
+                    observations=observations,
+                )
+
+            tool_name = payload.get("tool")
+            tool_result = self._execute_tool_call(evidence, payload)
+            observations.append(
+                {
+                    "tool_request": {
+                        "tool": tool_name,
+                        "args": payload.get("args") or {},
+                        "reason": payload.get("reason", ""),
+                    },
+                    "tool_result": tool_result,
+                }
+            )
+
+            if self._is_evidence_tool(tool_name):
+                evidence_tool_calls += 1
+
+            if not tool_result.get("ok"):
+                observations.append(
+                    {
+                        "event": "controlled_mode_abstain",
+                        "reason": "tool_call_failed",
+                    }
+                )
+                return self._controlled_abstain_result(
+                    summary=(
+                        "Controlled mode stopped because a required tool call failed."
+                    ),
+                    observations=observations,
+                )
+
+            if tool_name == "get_failed_logs":
+                log_rows = tool_result.get("result") or []
+                if isinstance(log_rows, list) and len(log_rows) > 0:
+                    has_log_evidence = True
+
+            if tool_name == "search_playbook":
+                chunks = (tool_result.get("result") or {}).get("chunks") or []
+                if isinstance(chunks, list) and len(chunks) > 0:
+                    has_rag_evidence = True
+
+        observations.append(
+            {
+                "event": "controlled_mode_abstain",
+                "reason": "max_turns_exceeded",
+                "max_reasoning_turns": self.max_reasoning_turns,
             }
+        )
+        return self._controlled_abstain_result(
+            summary=(
+                "Controlled mode reached the maximum reasoning turns "
+                "before satisfying evidence requirements."
+            ),
+            observations=observations,
+        )
+
+    def generate(
+        self,
+        evidence,
+        rag_context: list[dict] | None = None,
+        strict_grounding: bool = False,
+    ) -> dict:
+        try:
+            if getattr(self, "controlled_agent_mode", False):
+                return self._generate_controlled_agent_mode(
+                    evidence=evidence,
+                    strict_grounding=strict_grounding,
+                    rag_context=rag_context,
+                )
+
+            return self._generate_workflow_mode(
+                evidence=evidence,
+                rag_context=rag_context,
+                strict_grounding=strict_grounding,
+            )
         except APITimeoutError as exc:
             return self._fallback_result(exc)
         except Exception as exc:

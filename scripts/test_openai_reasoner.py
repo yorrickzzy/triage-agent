@@ -29,6 +29,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
         reasoner.client = Mock()
         reasoner.tools = None
+        reasoner.controlled_agent_mode = False
         reasoner.client.responses.create.side_effect = APITimeoutError(request=SimpleNamespace())
 
         evidence = SimpleNamespace(
@@ -58,6 +59,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
         reasoner.client = Mock()
         reasoner.tools = Mock()
+        reasoner.controlled_agent_mode = False
         reasoner.max_reasoning_turns = 3
         reasoner.tools.search_playbook.return_value = [
             {
@@ -106,6 +108,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
         reasoner.client = Mock()
         reasoner.tools = Mock()
+        reasoner.controlled_agent_mode = False
         reasoner.max_reasoning_turns = 3
 
         # 1) initial eager context pull
@@ -168,10 +171,91 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         _, kwargs = reasoner.client.responses.create.call_args
         self.assertIn("pytest failure usually maps to assertion mismatch", kwargs["input"])
 
+    def test_controlled_mode_requires_log_and_rag_evidence_before_final(self):
+        reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+        reasoner.client = Mock()
+        reasoner.tools = Mock()
+        reasoner.controlled_agent_mode = True
+        reasoner.max_reasoning_turns = 4
+        reasoner.OBSERVATIONS_BUDGET_CHARS = 4000
+
+        reasoner.tools.get_failed_logs.return_value = [
+            RawLog(
+                job_id=10,
+                job_name="unit-tests",
+                text="AssertionError: expected 30 got 45",
+                lines=["AssertionError: expected 30 got 45"],
+            )
+        ]
+        reasoner.tools.search_playbook.return_value = [
+            {
+                "source_type": "incident",
+                "source_id": 101,
+                "workflow_name": "ci",
+                "failure_class": "test",
+                "quality_score": 1.0,
+                "text": "historical pytest mismatch",
+            }
+        ]
+
+        reasoner.client.responses.create.side_effect = [
+            SimpleNamespace(
+                output_text=(
+                    '{"action":"final","rca":'
+                    '{"failure_class":"test","summary":"early",'
+                    '"claims":[],"suggested_next_step":"n",'
+                    '"confidence":0.9,"abstained":false}}'
+                )
+            ),
+            SimpleNamespace(
+                output_text=(
+                    '{"action":"tool_call","tool":"get_failed_logs",'
+                    '"args":{},"reason":"need raw evidence"}'
+                )
+            ),
+            SimpleNamespace(
+                output_text=(
+                    '{"action":"tool_call","tool":"search_playbook",'
+                    '"args":{"query":"ci unit-tests","limit":5},'
+                    '"reason":"need historical context"}'
+                )
+            ),
+            SimpleNamespace(
+                output_text=(
+                    '{"action":"final","rca":'
+                    '{"failure_class":"test","summary":"grounded",'
+                    '"claims":[],"suggested_next_step":"fix test",'
+                    '"confidence":0.92,"abstained":false}}'
+                )
+            ),
+        ]
+
+        evidence = SimpleNamespace(
+            run_id=123,
+            workflow_name="ci",
+            branch="main",
+            sha="abc123",
+            failed_jobs=["unit-tests"],
+            last_green_run_id=12,
+            diff="",
+            logs=[],
+        )
+
+        result = reasoner.generate(evidence)
+
+        self.assertEqual(result["summary"], "grounded")
+        self.assertEqual(reasoner.tools.get_failed_logs.call_count, 1)
+        self.assertEqual(reasoner.tools.search_playbook.call_count, 1)
+        trace = result["reasoning_trace"]
+        self.assertEqual(trace[0].get("event"), "final_blocked")
+        self.assertEqual(trace[1]["tool_request"]["tool"], "get_failed_logs")
+        self.assertEqual(trace[2]["tool_request"]["tool"], "search_playbook")
+
     def test_execute_tool_call_routes_all_documented_tools(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
         reasoner.client = Mock()
         reasoner.tools = Mock()
+        reasoner.controlled_agent_mode = False
         reasoner.max_reasoning_turns = 3
 
         reasoner.tools.get_failed_logs.return_value = [
@@ -256,6 +340,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
         reasoner.client = Mock()
         reasoner.tools = None
+        reasoner.controlled_agent_mode = False
         reasoner.max_reasoning_turns = 1
         reasoner.LOGS_BUDGET_CHARS = 80
         reasoner.DIFF_BUDGET_CHARS = 60
@@ -296,6 +381,45 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         prompt = kwargs["input"]
         self.assertIn("logs_truncated: true", prompt)
         self.assertIn("diff_truncated: true", prompt)
+
+    def test_controlled_mode_abstains_after_turn_limit_without_workflow_fallback(self):
+        reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+        reasoner.client = Mock()
+        reasoner.tools = Mock()
+        reasoner.controlled_agent_mode = True
+        reasoner.max_reasoning_turns = 1
+        reasoner.OBSERVATIONS_BUDGET_CHARS = 4000
+
+        reasoner.client.responses.create.return_value = SimpleNamespace(
+            output_text=(
+                '{"action":"final","rca":'
+                '{"failure_class":"test","summary":"early",'
+                '"claims":[],"suggested_next_step":"n",'
+                '"confidence":0.8,"abstained":false}}'
+            )
+        )
+
+        evidence = SimpleNamespace(
+            run_id=123,
+            workflow_name="ci",
+            branch="main",
+            sha="abc123",
+            failed_jobs=["unit-tests"],
+            last_green_run_id=12,
+            diff="",
+            logs=[],
+        )
+
+        result = reasoner.generate(evidence)
+
+        self.assertTrue(result["abstained"])
+        self.assertIn("maximum reasoning turns", result["summary"])
+        self.assertEqual(reasoner.client.responses.create.call_count, 1)
+        self.assertEqual(reasoner.tools.get_failed_logs.call_count, 0)
+        self.assertEqual(reasoner.tools.search_playbook.call_count, 0)
+        trace = result["reasoning_trace"]
+        self.assertEqual(trace[0].get("event"), "final_blocked")
+        self.assertEqual(trace[1].get("event"), "controlled_mode_abstain")
 
 
 if __name__ == "__main__":
