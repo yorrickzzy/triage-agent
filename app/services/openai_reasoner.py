@@ -12,7 +12,7 @@ class OpenAIReasoner:
     LOGS_BUDGET_CHARS = 10000
     DIFF_BUDGET_CHARS = 2500
     RAG_BUDGET_CHARS = 2500
-    OBSERVATIONS_BUDGET_CHARS = 2000
+    OBSERVATIONS_BUDGET_CHARS = 6000
     LOG_WINDOW_RADIUS = 40
     LOG_MAX_ANCHORS = 8
     LOG_FALLBACK_HEAD_LINES = 120
@@ -187,17 +187,14 @@ class OpenAIReasoner:
 
         for raw_log in logs:
             line_count = len(raw_log.lines)
-            truncated_lines = raw_log.lines[:300]
+            windowed, truncated = self._windowed_numbered_lines(raw_log)
             serialized.append(
                 {
                     "job_id": raw_log.job_id,
                     "job_name": raw_log.job_name,
                     "line_count": line_count,
-                    "truncated": line_count > len(truncated_lines),
-                    "numbered_lines": "\n".join(
-                        f"{idx + 1} | {line}"
-                        for idx, line in enumerate(truncated_lines)
-                    ),
+                    "truncated": truncated,
+                    "numbered_lines": windowed,
                 }
             )
 
