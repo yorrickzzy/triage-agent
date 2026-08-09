@@ -44,6 +44,24 @@ def create_tables() -> None:
     Base.metadata.create_all(bind=engine)
 
     with engine.begin() as conn:
+        if conn.dialect.name == "postgresql":
+            conn.execute(
+                text(
+                    "ALTER TABLE incidents "
+                    "ADD COLUMN IF NOT EXISTS reasoning_trace TEXT"
+                )
+            )
+        elif conn.dialect.name == "sqlite":
+            columns = conn.execute(text("PRAGMA table_info(incidents)"))
+            existing_names = {row[1] for row in columns}
+            if "reasoning_trace" not in existing_names:
+                conn.execute(
+                    text(
+                        "ALTER TABLE incidents "
+                        "ADD COLUMN reasoning_trace TEXT"
+                    )
+                )
+
         if ENABLE_PGVECTOR:
             # Provision pgvector mode when explicitly enabled.
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))

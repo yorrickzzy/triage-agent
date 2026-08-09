@@ -13,6 +13,7 @@ from app.services.triage_service import TriageService
 from app.services.slack_client import SlackClient
 from app.services.incident_store import IncidentStore
 from app.services.rag_store import RagStore
+from app.services.triage_toolbelt import DefaultTriageToolbelt
 
 
 def build_triage_service() -> TriageService:
@@ -29,7 +30,9 @@ def build_triage_service() -> TriageService:
     redactor = Redactor()
     evidence_collector = EvidenceCollector(github_client, redactor=redactor)
 
-    reasoner = OpenAIReasoner()
+    rag_store = RagStore(SessionLocal)
+    toolbelt = DefaultTriageToolbelt(github_client, rag_store)
+    reasoner = OpenAIReasoner(tools=toolbelt)
     classifier = FailureClassifier()
     verifier = GroundingVerifier()
 
@@ -44,7 +47,6 @@ def build_triage_service() -> TriageService:
     github_delivery = GitHubDelivery(github_client)
     slack_client = SlackClient()
     incident_store = IncidentStore(SessionLocal)
-    rag_store = RagStore(SessionLocal)
 
     return TriageService(
         evidence_collector=evidence_collector,
@@ -56,4 +58,5 @@ def build_triage_service() -> TriageService:
         slack_client=slack_client,
         incident_store=incident_store,
         rag_store=rag_store,
+        tools=toolbelt,
     )

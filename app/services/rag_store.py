@@ -121,20 +121,35 @@ class RagStore:
         parts = [evidence.workflow_name or "", *keywords]
         return " ".join(part for part in parts if part)
 
-    def _try_vector_retrieve(self, session: Session, evidence, limit: int) -> list[dict] | None:
+    def _build_query_terms(self, query: str) -> list[str]:
+        terms = []
+
+        for token in re.findall(r"[a-z0-9]+", query.lower()):
+            if token not in terms:
+                terms.append(token)
+
+        return terms
+
+    def _try_vector_search(
+        self,
+        session: Session,
+        query: str,
+        limit: int,
+        source_type: str | None = None,
+        workflow_name: str | None = None,
+    ) -> list[dict] | None:
         if not ENABLE_PGVECTOR or Vector is None:
             return None
 
-        query_text = self._build_query_text(evidence)
-        query_embedding = self._build_embedding(query_text)
+        query_embedding = self._build_embedding(query)
 
         try:
             statement = text(
                 """
                 SELECT id, source_type, source_id, workflow_name, failure_class, text, quality_score
                 FROM rag_chunks
-                WHERE source_type = :source_type
-                AND (:workflow_name = '' OR workflow_name = :workflow_name)
+                WHERE (:source_type IS NULL OR source_type = :source_type)
+                  AND (:workflow_name IS NULL OR workflow_name = :workflow_name)
                 ORDER BY embedding <-> CAST(:embedding AS vector(32)) DESC,
                          quality_score DESC,
                          created_at DESC
@@ -144,8 +159,8 @@ class RagStore:
             rows = session.execute(
                 statement,
                 {
-                    "source_type": "incident",
-                    "workflow_name": evidence.workflow_name or "",
+                    "source_type": source_type,
+                    "workflow_name": workflow_name,
                     "embedding": f"[{','.join(f'{value:.6f}' for value in query_embedding)}]",
                     "limit": limit,
                 },
@@ -168,24 +183,23 @@ class RagStore:
             session.rollback()
             return None
 
-    def _sql_fallback_retrieve(self, session: Session, evidence, limit: int) -> list[dict]:
-        keywords = []
-        for job_name in evidence.failed_jobs:
-            if not isinstance(job_name, str):
-                continue
+    def _sql_fallback_search(
+        self,
+        session: Session,
+        query: str,
+        limit: int,
+        source_type: str | None = None,
+        workflow_name: str | None = None,
+    ) -> list[dict]:
+        keywords = self._build_query_terms(query)
 
-            token = job_name.strip().lower()
-            if token and token not in keywords:
-                keywords.append(token)
+        statement = select(RagChunk)
 
-        statement = select(RagChunk).where(
-            RagChunk.source_type == "incident",
-        )
+        if source_type is not None:
+            statement = statement.where(RagChunk.source_type == source_type)
 
-        if evidence.workflow_name:
-            statement = statement.where(
-                RagChunk.workflow_name == evidence.workflow_name,
-            )
+        if workflow_name is not None:
+            statement = statement.where(RagChunk.workflow_name == workflow_name)
 
         if keywords:
             statement = statement.where(
@@ -220,14 +234,42 @@ class RagStore:
             for chunk in chunks
         ]
 
+    def search_playbook(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> list[dict]:
+        query = query.strip()
+
+        with self.session_factory() as session:
+            vector_results = self._try_vector_search(session, query, limit)
+            if vector_results is not None:
+                return vector_results
+
+            return self._sql_fallback_search(session, query, limit)
+
     def retrieve_for_evidence(
         self,
         evidence,
         limit: int = 5,
     ) -> list[dict]:
+        query = self._build_query_text(evidence)
+
         with self.session_factory() as session:
-            vector_results = self._try_vector_retrieve(session, evidence, limit)
+            vector_results = self._try_vector_search(
+                session,
+                query,
+                limit,
+                source_type="incident",
+                workflow_name=evidence.workflow_name,
+            )
             if vector_results is not None:
                 return vector_results
 
-            return self._sql_fallback_retrieve(session, evidence, limit)
+            return self._sql_fallback_search(
+                session,
+                query,
+                limit,
+                source_type="incident",
+                workflow_name=evidence.workflow_name,
+            )

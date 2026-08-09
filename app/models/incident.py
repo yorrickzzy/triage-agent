@@ -81,6 +81,11 @@ class Incident(Base):
         nullable=True,
     )
 
+    reasoning_trace: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

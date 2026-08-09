@@ -1,5 +1,6 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+import json
 
 from app.models.incident import Incident
 
@@ -17,6 +18,14 @@ class IncidentStore:
         decision_reason: str = "Delivery is pending.",
         comment_url: str | None = None,
     ) -> Incident:
+        trace_payload = rca.get("reasoning_trace")
+        reasoning_trace = None
+        if isinstance(trace_payload, (list, dict)):
+            reasoning_trace = json.dumps(
+                trace_payload,
+                ensure_ascii=False,
+            )
+
         incident = Incident(
             run_id=evidence.run_id,
             workflow_name=evidence.workflow_name,
@@ -34,6 +43,7 @@ class IncidentStore:
             action=action,
             decision_reason=decision_reason,
             comment_url=comment_url,
+            reasoning_trace=reasoning_trace,
         )
 
         with self.session_factory() as session:

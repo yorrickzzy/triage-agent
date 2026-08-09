@@ -31,6 +31,7 @@ class TriageService:
         slack_client,
         incident_store,
         rag_store=None,
+        tools=None,
     ):
         self.evidence_collector = evidence_collector
         self.rca_pipeline = rca_pipeline
@@ -41,6 +42,7 @@ class TriageService:
         self.slack_client = slack_client
         self.incident_store = incident_store
         self.rag_store = rag_store
+        self.tools = tools
 
     
 
