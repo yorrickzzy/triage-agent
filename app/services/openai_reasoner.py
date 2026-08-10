@@ -328,7 +328,8 @@ Hard constraints:
 - Call-order guidance:
     1) If log evidence is missing, call get_failed_logs first.
     2) If log evidence exists but historical evidence is missing, call search_playbook next.
-    3) Once both evidence requirements are satisfied, return final RCA immediately.
+    3) Once both evidence requirements are satisfied, return final RCA if the current evidence is sufficient and grounded; otherwise request one additional tool call only when it materially reduces uncertainty.
+    4) Do not call extra tools unless they reduce uncertainty.
 - Never cite diff or historical context as primary evidence claims.
 
 Available tools:
