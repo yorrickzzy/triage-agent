@@ -5,6 +5,9 @@ TIMESTAMP_PATTERN = re.compile(
 )
 # Strips "123 | " line-number prefix the model copies from numbered log output.
 LINE_NUMBER_PREFIX = re.compile(r"^\d+\s*\|\s*")
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+CONTROL_CHAR_PATTERN = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+ESCAPED_UNICODE_CONTROL_PATTERN = re.compile(r"\\u00[0-9a-fA-F]{2}")
 
 class GroundingVerifier:
 
@@ -12,6 +15,9 @@ class GroundingVerifier:
         lines = []
 
         for line in text.splitlines():
+            line = ANSI_ESCAPE_PATTERN.sub("", line)
+            line = ESCAPED_UNICODE_CONTROL_PATTERN.sub("", line)
+            line = CONTROL_CHAR_PATTERN.sub("", line)
             line = LINE_NUMBER_PREFIX.sub("", line)
             line = TIMESTAMP_PATTERN.sub("", line)
             lines.append(line.rstrip())
