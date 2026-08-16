@@ -7,3 +7,6 @@ sqlalchemy
 psycopg[binary]
 pydantic
 pgvector
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http

@@ -20,6 +20,7 @@ from app.services.failure_classifier import FailureClassifier
 from app.services.grounding_verifier import GroundingVerifier
 from app.services.openai_reasoner import OpenAIReasoner
 from app.services.rca_pipeline import RCAPipeline
+from app.services.replay_toolbelt import ReplayToolbelt
 
 
 @dataclass
@@ -31,6 +32,8 @@ class ReplaySample:
     true_cause: str | None = None
     ambiguous: bool | None = None
     note: str | None = None
+    playbook_chunks: list[dict[str, Any]] | None = None
+    rerun_accepted: bool = False
 
 
 @dataclass
@@ -67,6 +70,8 @@ def _load_samples(path: Path) -> list[ReplaySample]:
                 true_cause=item.get("true_cause"),
                 ambiguous=item.get("ambiguous"),
                 note=item.get("note"),
+                playbook_chunks=item.get("playbook_chunks"),
+                rerun_accepted=bool(item.get("rerun_accepted", False)),
             )
         )
 
@@ -103,8 +108,16 @@ def _evidence_from_dict(item: dict[str, Any]) -> Evidence:
     )
 
 
-def _build_pipeline() -> tuple[RCAPipeline, ConfidenceGate]:
-    reasoner = OpenAIReasoner()
+def _build_pipeline(
+    evidence: Evidence,
+    sample: ReplaySample,
+) -> tuple[RCAPipeline, ConfidenceGate]:
+    tools = ReplayToolbelt(
+        evidence=evidence,
+        playbook_chunks=sample.playbook_chunks,
+        rerun_accepted=sample.rerun_accepted,
+    )
+    reasoner = OpenAIReasoner(tools=tools)
     classifier = FailureClassifier()
     verifier = GroundingVerifier()
 
@@ -118,13 +131,10 @@ def _build_pipeline() -> tuple[RCAPipeline, ConfidenceGate]:
     return pipeline, confidence_gate
 
 
-def _run_sample(
-    sample: ReplaySample,
-    pipeline: RCAPipeline,
-    confidence_gate: ConfidenceGate,
-) -> ReplayResult:
+def _run_sample(sample: ReplaySample) -> ReplayResult:
     evidence = _evidence_from_dict(sample.evidence)
     try:
+        pipeline, confidence_gate = _build_pipeline(evidence, sample)
         rca = pipeline.run(evidence)
         gate_result = confidence_gate.evaluate(rca)
         grounding_passed = pipeline.verifier.verify(rca, evidence)
@@ -295,11 +305,9 @@ def main() -> int:
         )
         return 1
 
-    pipeline, confidence_gate = _build_pipeline()
-
     results = []
     for sample in samples:
-        result = _run_sample(sample, pipeline, confidence_gate)
+        result = _run_sample(sample)
         results.append(result)
         _print_result(result)
 

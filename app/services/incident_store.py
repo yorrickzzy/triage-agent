@@ -2,6 +2,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 import json
 
+from app.core.telemetry import record_exception, set_span_attributes, tracer
 from app.models.incident import Incident
 
 
@@ -10,6 +11,47 @@ class IncidentStore:
         self.session_factory = session_factory
 
     def create_incident(
+        self,
+        *,
+        evidence,
+        rca: dict,
+        action: str = "pending",
+        decision_reason: str = "Delivery is pending.",
+        comment_url: str | None = None,
+    ) -> Incident:
+        if tracer is None:
+            return self._create_incident_impl(
+                evidence=evidence,
+                rca=rca,
+                action=action,
+                decision_reason=decision_reason,
+                comment_url=comment_url,
+            )
+
+        with tracer.start_as_current_span("incident.persist") as span:
+            try:
+                set_span_attributes(
+                    span,
+                    run_id=evidence.run_id,
+                    workflow_name=evidence.workflow_name,
+                    failure_class=rca.get("failure_class", "unknown"),
+                    confidence=rca.get("confidence", 0.0),
+                    abstained=bool(rca.get("abstained", False)),
+                )
+                incident = self._create_incident_impl(
+                    evidence=evidence,
+                    rca=rca,
+                    action=action,
+                    decision_reason=decision_reason,
+                    comment_url=comment_url,
+                )
+                set_span_attributes(span, incident_id=incident.id)
+                return incident
+            except Exception as exc:
+                record_exception(span, exc)
+                raise
+
+    def _create_incident_impl(
         self,
         *,
         evidence,

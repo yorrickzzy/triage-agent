@@ -4,6 +4,7 @@ from dataclasses import asdict, is_dataclass
 from openai import APITimeoutError, OpenAI
 
 from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
+from app.core.telemetry import record_exception, set_span_attributes, tracer
 
 
 class OpenAIReasoner:
@@ -382,6 +383,40 @@ Tool observations (the only detailed context you currently have):
         }
 
     def _execute_tool_call(self, evidence, payload: dict) -> dict:
+        if self.tools is None:
+            return {
+                "ok": False,
+                "error": "toolbelt is not configured",
+            }
+
+        tool_name = payload.get("tool")
+        args = payload.get("args") or {}
+        span_name = f"agent.tool_call.{tool_name}" if tool_name else "agent.tool_call"
+
+        if tracer is None:
+            return self._execute_tool_call_impl(evidence, payload)
+
+        with tracer.start_as_current_span(span_name) as span:
+            try:
+                set_span_attributes(
+                    span,
+                    run_id=evidence.run_id,
+                    workflow_name=evidence.workflow_name,
+                    tool_name=tool_name,
+                    tool_args=json.dumps(args, ensure_ascii=False)[:500],
+                )
+                result = self._execute_tool_call_impl(evidence, payload)
+                set_span_attributes(
+                    span,
+                    ok=bool(result.get("ok", False)),
+                    result_error=result.get("error"),
+                )
+                return result
+            except Exception as exc:
+                record_exception(span, exc)
+                raise
+
+    def _execute_tool_call_impl(self, evidence, payload: dict) -> dict:
         if self.tools is None:
             return {
                 "ok": False,

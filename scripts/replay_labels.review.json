@@ -1,0 +1,204 @@
+{
+  "labels": [
+    {
+      "run_id": 31395176884,
+      "expected_failure_class": "build",
+      "expected_abstain": false,
+      "true_cause": "calculator.py contains an unclosed parenthesis, causing Python SyntaxError before tests can run.",
+      "ambiguous": false,
+      "note": "Review: SyntaxError '(' was never closed is explicit in the failed-job log."
+    },
+    {
+      "run_id": 31392733932,
+      "expected_failure_class": "build",
+      "expected_abstain": false,
+      "true_cause": "calculator.py contains an unclosed parenthesis, causing Python SyntaxError before tests can run.",
+      "ambiguous": false,
+      "note": "Review: SyntaxError '(' was never closed is explicit in the failed-job log."
+    },
+    {
+      "run_id": 31319843611,
+      "expected_failure_class": "build",
+      "expected_abstain": false,
+      "true_cause": "calculator.py contains an unclosed parenthesis, causing Python SyntaxError before tests can run.",
+      "ambiguous": false,
+      "note": "Review: SyntaxError '(' was never closed is explicit in the failed-job log."
+    },
+    {
+      "run_id": 31310245428,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "The test job imports definitely_not_installed_pkg, which is unavailable in the environment.",
+      "ambiguous": false,
+      "note": "Review: ModuleNotFoundError names definitely_not_installed_pkg."
+    },
+    {
+      "run_id": 31309513080,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "The test job imports definitely_not_installed_pkg, which is unavailable in the environment.",
+      "ambiguous": false,
+      "note": "Review: ModuleNotFoundError names definitely_not_installed_pkg."
+    },
+    {
+      "run_id": 31308868876,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "The test job imports definitely_not_installed_pkg, which is unavailable in the environment.",
+      "ambiguous": false,
+      "note": "Review: ModuleNotFoundError names definitely_not_installed_pkg."
+    },
+    {
+      "run_id": 31307743579,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "The test job imports definitely_not_installed_pkg, which is unavailable in the environment.",
+      "ambiguous": false,
+      "note": "Review: ModuleNotFoundError names definitely_not_installed_pkg."
+    },
+    {
+      "run_id": 31307072970,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "The test job imports definitely_not_installed_pkg, which is unavailable in the environment.",
+      "ambiguous": false,
+      "note": "Review: ModuleNotFoundError names definitely_not_installed_pkg."
+    },
+    {
+      "run_id": 31304144754,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "The test job imports definitely_not_installed_pkg, which is unavailable in the environment.",
+      "ambiguous": false,
+      "note": "Review: ModuleNotFoundError names definitely_not_installed_pkg."
+    },
+    {
+      "run_id": 31297179589,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "The test job imports definitely_not_installed_pkg, which is unavailable in the environment.",
+      "ambiguous": false,
+      "note": "Review: ModuleNotFoundError names definitely_not_installed_pkg."
+    },
+    {
+      "run_id": 31296121677,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "The test job imports definitely_not_installed_pkg, which is unavailable in the environment.",
+      "ambiguous": false,
+      "note": "Review: ModuleNotFoundError names definitely_not_installed_pkg."
+    },
+    {
+      "run_id": 31294727085,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "Pytest collected zero tests and exited with code 5.",
+      "ambiguous": false,
+      "note": "Review: Log explicitly reports collected 0 items and no tests ran."
+    },
+    {
+      "run_id": 31290680707,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "Pytest collected zero tests and exited with code 5.",
+      "ambiguous": false,
+      "note": "Review: Log explicitly reports collected 0 items and no tests ran."
+    },
+    {
+      "run_id": 31290596814,
+      "expected_failure_class": "build",
+      "expected_abstain": false,
+      "true_cause": "calculator.py has an invalid function body indentation, causing IndentationError during test collection.",
+      "ambiguous": false,
+      "note": "Review: Log explicitly reports IndentationError after function definition on line 1."
+    },
+    {
+      "run_id": 31250670486,
+      "expected_failure_class": "build",
+      "expected_abstain": false,
+      "true_cause": "calculator.py has an invalid function body indentation, causing IndentationError during test collection.",
+      "ambiguous": false,
+      "note": "Review: Log explicitly reports IndentationError after function definition on line 1."
+    },
+    {
+      "run_id": 31106568579,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 3, but add returns 16.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 16 == 3."
+    },
+    {
+      "run_id": 31104798405,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 3, but add returns 15.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 15 == 3."
+    },
+    {
+      "run_id": 31103438610,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 3, but add returns 13.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 13 == 3."
+    },
+    {
+      "run_id": 30692536886,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 3, but add returns 11.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 11 == 3."
+    },
+    {
+      "run_id": 30692133956,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 3, but add returns 9.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 9 == 3."
+    },
+    {
+      "run_id": 30691753516,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 3, but add returns 8.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 8 == 3."
+    },
+    {
+      "run_id": 30690459242,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 3, but add returns 7.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 7 == 3."
+    },
+    {
+      "run_id": 30689044379,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 3, but add returns 6.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 6 == 3."
+    },
+    {
+      "run_id": 28731123848,
+      "expected_failure_class": "test",
+      "expected_abstain": false,
+      "true_cause": "tests/test_calculator.py::test_add expects 4, but add returns 3.",
+      "ambiguous": false,
+      "note": "Review: AssertionError explicitly reports assert 3 == 4."
+    },
+    {
+      "run_id": 28730753019,
+      "expected_failure_class": "dependency",
+      "expected_abstain": false,
+      "true_cause": "Pytest cannot import the calculator module, causing ModuleNotFoundError during test collection.",
+      "ambiguous": false,
+      "note": "Review: ImportError and ModuleNotFoundError explicitly name calculator."
+    }
+  ]
+}

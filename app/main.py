@@ -3,12 +3,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.core.database import create_tables
+from app.core.telemetry import configure_telemetry
 from app.routes.github_webhook import router as github_router
 from app.services.triage_worker import start_worker
 from app.routes.feedback import router as feedback_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    configure_telemetry(service_name="triage-agent")
     create_tables()
     start_worker()
 

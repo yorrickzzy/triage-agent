@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from app.core.telemetry import record_exception, set_span_attributes, tracer
 from app.services.github_client import GitHubRerunTimeoutError
 
 TriageAction = Literal[
@@ -47,6 +48,27 @@ class TriageService:
     
 
     def triage(self, run_id: int) -> TriageResult:
+        if tracer is None:
+            return self._triage_impl(run_id)
+
+        with tracer.start_as_current_span("triage.service") as span:
+            try:
+                set_span_attributes(
+                    span,
+                    run_id=run_id,
+                )
+                result = self._triage_impl(run_id)
+                set_span_attributes(
+                    span,
+                    action=result.action,
+                    incident_id=result.incident_id,
+                )
+                return result
+            except Exception as exc:
+                record_exception(span, exc)
+                raise
+
+    def _triage_impl(self, run_id: int) -> TriageResult:
         evidence = self.evidence_collector.collect(run_id)
         rag_context = []
         if self.rag_store is not None:
