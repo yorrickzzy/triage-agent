@@ -1,9 +1,9 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, DateTime, Float, String, Text
+from sqlalchemy import BigInteger, Integer, DateTime, Float, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.config import ENABLE_PGVECTOR
+from app.core.config import ENABLE_PGVECTOR, RAG_EMBEDDING_DIMENSIONS
 from app.core.database import Base
 
 try:
@@ -16,7 +16,7 @@ class RagChunk(Base):
     __tablename__ = "rag_chunks"
 
     id: Mapped[int] = mapped_column(
-        BigInteger,
+        BigInteger().with_variant(Integer, "sqlite"),
         primary_key=True,
         autoincrement=True,
     )
@@ -66,6 +66,14 @@ class RagChunk(Base):
             Text,
             nullable=True,
         )
+
+    # Legacy embedding remains untouched; only this column holds semantic vectors.
+    semantic_embedding: Mapped[list[float] | str | None] = mapped_column(
+        Vector(RAG_EMBEDDING_DIMENSIONS)
+        if ENABLE_PGVECTOR and Vector is not None else Text,
+        nullable=True,
+    )
+    embedding_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

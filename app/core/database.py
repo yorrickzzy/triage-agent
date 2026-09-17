@@ -1,9 +1,9 @@
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-from app.core.config import DATABASE_URL, ENABLE_PGVECTOR
+from app.core.config import DATABASE_URL, ENABLE_PGVECTOR, RAG_EMBEDDING_DIMENSIONS
 
 
 if not DATABASE_URL:
@@ -41,6 +41,11 @@ def create_tables() -> None:
     from app.models.incident import Incident  # noqa: F401
     from app.models.rag_chunk import RagChunk  # noqa: F401
 
+    if ENABLE_PGVECTOR:
+        if engine.dialect.name != "postgresql":
+            raise RuntimeError("ENABLE_PGVECTOR requires PostgreSQL")
+        with engine.begin() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
     Base.metadata.create_all(bind=engine)
 
     with engine.begin() as conn:
@@ -62,36 +67,20 @@ def create_tables() -> None:
                     )
                 )
 
+        # Additive migration preserves old hashes and all incident/feedback data.
+        existing = {column["name"] for column in inspect(conn).get_columns("rag_chunks")}
+        for name, sql_type in (
+            ("embedding", "TEXT"),
+            ("semantic_embedding", "TEXT"),
+            ("embedding_model", "VARCHAR(255)"),
+        ):
+            if name not in existing:
+                conn.execute(text(f"ALTER TABLE rag_chunks ADD COLUMN {name} {sql_type}"))
         if ENABLE_PGVECTOR:
-            # Provision pgvector mode when explicitly enabled.
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-
-            # Ensure the embedding column exists first.
-            conn.execute(
-                text(
-                    "ALTER TABLE rag_chunks "
-                    "ADD COLUMN IF NOT EXISTS embedding TEXT"
-                )
-            )
-
-            # Convert text/json-string embeddings into vector values.
-            conn.execute(
-                text(
-                    """
-                    ALTER TABLE rag_chunks
-                    ALTER COLUMN embedding TYPE vector(32)
-                    USING CASE
-                      WHEN embedding IS NULL OR btrim(embedding::text) = '' THEN NULL
-                      ELSE embedding::vector(32)
-                    END
-                    """
-                )
-            )
-        else:
-            # Backward-compatible fallback without pgvector.
-            conn.execute(
-                text(
-                    "ALTER TABLE rag_chunks "
-                    "ADD COLUMN IF NOT EXISTS embedding TEXT"
-                )
-            )
+            columns = {column["name"]: column for column in inspect(conn).get_columns("rag_chunks")}
+            if str(columns["semantic_embedding"]["type"]).upper() != f"VECTOR({RAG_EMBEDDING_DIMENSIONS})":
+                conn.execute(text(
+                    f"ALTER TABLE rag_chunks ALTER COLUMN semantic_embedding "
+                    f"TYPE vector({RAG_EMBEDDING_DIMENSIONS}) "
+                    f"USING NULLIF(semantic_embedding::text, '')::vector({RAG_EMBEDDING_DIMENSIONS})"
+                ))

@@ -168,7 +168,8 @@ For local webhook testing, expose port 8000 through a secure tunnel and set both
 | `SLACK_CHANNEL_ID` | No | — | Destination Slack channel |
 | `APP_BASE_URL` | No | `http://localhost:8000` | Base URL used in feedback links |
 | `RCA_CONFIDENCE_THRESHOLD` | No | `0.8` | Minimum confidence for delivery |
-| `ENABLE_PGVECTOR` | No | `false` | Enables 32-dimensional pgvector storage/search |
+| `ENABLE_PGVECTOR` | No | `false` | Enables 1536-dimensional semantic pgvector search |
+| `RAG_EMBEDDING_MODEL` | No | `text-embedding-3-small` | OpenAI embedding model supporting the dimensions parameter |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | No | `http://localhost:4318/v1/traces` | OTLP/HTTP trace collector endpoint |
 
 Never commit `.env` or real credentials to source control.
@@ -222,6 +223,53 @@ python scripts/replay_harness.py \
 ```
 
 Replay reasoning still uses the configured OpenAI model, while GitHub-facing tools are replaced with replay implementations.
+
+## Semantic RAG embeddings
+
+RAG uses OpenAI `text-embedding-3-small` with 1536 dimensions for both case
+text and queries, using the existing `OPENAI_API_KEY`. Input is capped at
+6000 UTF-8 bytes; full case text remains stored. See the
+[OpenAI embeddings guide](https://developers.openai.com/api/docs/guides/embeddings).
+
+Startup adds `semantic_embedding` and `embedding_model` to `rag_chunks`.
+The legacy 32-dimensional `embedding` column is preserved but no longer searched.
+Only non-null vectors from the configured model participate in vector ranking.
+Ranking remains distance first, then quality score, then creation time; tool
+interfaces, query construction, and the default five-result limit are unchanged.
+
+On EC2, after syncing this code, set these values in `.env`:
+
+```dotenv
+ENABLE_PGVECTOR=true
+RAG_EMBEDDING_MODEL=text-embedding-3-small
+```
+
+Rebuild the app, then backfill existing cases:
+
+```bash
+docker compose up -d --build app
+docker compose exec app python scripts/reindex_rag_embeddings.py
+```
+
+Backfill makes billable embedding API calls. Each completed row is committed;
+rerunning skips current vectors and resumes after failures. Existing case text,
+quality scores, and creation times are preserved. Run it again after changing
+`RAG_EMBEDDING_MODEL` or recovering from an embedding outage. The selected model
+must support 1536 dimensions and the API's `dimensions` parameter.
+
+New cases are embedded when indexed. If the API fails, the case is saved without
+a semantic vector for later backfill, so report delivery can continue. Retrieval
+falls back to the existing SQL keyword search if vector search is disabled,
+fails, or returns no eligible vectors. During backfill, vector results include
+only already-indexed cases; complete the backfill before evaluating relevance.
+Without pgvector, vectors are stored as JSON text and retrieval remains keyword
+based.
+
+Verify backfill on the Compose PostgreSQL database:
+
+```bash
+docker compose exec postgres psql -U chamber -d chamber -c "SELECT embedding_model, count(*), count(semantic_embedding) AS embedded FROM rag_chunks GROUP BY embedding_model;"
+```
 
 ## Operational Notes
 

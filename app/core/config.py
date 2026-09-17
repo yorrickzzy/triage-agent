@@ -29,3 +29,6 @@ ENABLE_PGVECTOR = (
     os.getenv("ENABLE_PGVECTOR", "false").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+# Keep dimensions fixed to match the semantic vector column.
+RAG_EMBEDDING_MODEL = os.getenv("RAG_EMBEDDING_MODEL", "text-embedding-3-small")
+RAG_EMBEDDING_DIMENSIONS = 1536

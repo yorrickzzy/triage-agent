@@ -1,11 +1,15 @@
-import hashlib
+import math
 import json
 import re
+
+from openai import OpenAI
 
 from sqlalchemy import desc, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.config import ENABLE_PGVECTOR
+from app.core.config import (
+    ENABLE_PGVECTOR, OPENAI_API_KEY, RAG_EMBEDDING_MODEL, RAG_EMBEDDING_DIMENSIONS,
+)
 from app.models.rag_chunk import RagChunk
 
 try:
@@ -18,25 +22,28 @@ class RagStore:
     def __init__(
         self,
         session_factory: sessionmaker[Session],
+        embedding_client=None,
     ) -> None:
         self.session_factory = session_factory
+        self.embedding_client = embedding_client
 
     def _build_embedding(self, text: str) -> list[float]:
-        tokens = re.findall(r"[a-z0-9]+", text.lower())
-        if not tokens:
-            return [0.0] * 32
-
-        vector = [0.0] * 32
-        for token in tokens:
-            digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
-            index = int(digest[:8], 16) % 32
-            vector[index] += 1.0
-
-        norm = sum(value * value for value in vector) ** 0.5
-        if norm == 0:
-            return [0.0] * 32
-
-        return [value / norm for value in vector]
+        # Bound UTF-8 bytes conservatively below the embedding input token limit.
+        text = text.strip().encode("utf-8")[:6000].decode("utf-8", errors="ignore")
+        if not text:
+            raise ValueError("Embedding input must not be empty")
+        if self.embedding_client is None:
+            self.embedding_client = OpenAI(api_key=OPENAI_API_KEY, timeout=20.0, max_retries=1)
+        response = self.embedding_client.embeddings.create(
+            model=RAG_EMBEDDING_MODEL, input=text,
+            dimensions=RAG_EMBEDDING_DIMENSIONS, encoding_format="float",
+        )
+        vector = response.data[0].embedding
+        if len(vector) != RAG_EMBEDDING_DIMENSIONS or not all(math.isfinite(v) for v in vector):
+            raise ValueError("Invalid semantic embedding returned by API")
+        if not any(vector):
+            raise ValueError("Embedding must not be a zero vector")
+        return vector
 
     def _serialize_embedding(self, embedding: list[float]) -> str | list[float]:
         if not ENABLE_PGVECTOR or Vector is None:
@@ -56,7 +63,11 @@ class RagStore:
             f"confidence={incident.confidence:.2f}; "
             f"action={incident.action}"
         )
-        embedding = self._build_embedding(text)
+        embedding = None
+        try:
+            embedding = self._build_embedding(text)
+        except Exception as exc:
+            print(f"[rag] embedding unavailable ({type(exc).__name__}); saved for backfill", flush=True)
 
         with self.session_factory() as session:
             chunk = RagChunk(
@@ -65,7 +76,8 @@ class RagStore:
                 workflow_name=incident.workflow_name,
                 failure_class=incident.failure_class,
                 text=text,
-                embedding=self._serialize_embedding(embedding),
+                semantic_embedding=self._serialize_embedding(embedding) if embedding is not None else None,
+                embedding_model=RAG_EMBEDDING_MODEL if embedding is not None else None,
                 quality_score=0.0,
             )
 
@@ -74,6 +86,30 @@ class RagStore:
             session.refresh(chunk)
 
             return chunk
+
+    def reindex_embeddings(self) -> int:
+        """Rebuild missing/outdated vectors; each commit is a resumable checkpoint."""
+        count = 0
+        last_id = -1
+        while True:
+            with self.session_factory() as session:
+                chunk = session.scalars(
+                    select(RagChunk).where(
+                        RagChunk.id > last_id,
+                        or_(RagChunk.semantic_embedding.is_(None),
+                            RagChunk.embedding_model.is_(None),
+                            RagChunk.embedding_model != RAG_EMBEDDING_MODEL),
+                    ).order_by(RagChunk.id).limit(1)
+                ).first()
+                if chunk is None:
+                    return count
+                vector = self._build_embedding(chunk.text)
+                chunk.semantic_embedding = self._serialize_embedding(vector)
+                chunk.embedding_model = RAG_EMBEDDING_MODEL
+                session.commit()
+                last_id = chunk.id
+                count += 1
+                print(f"[rag] reindexed chunk_id={last_id}", flush=True)
 
     def apply_feedback(
         self,
@@ -141,16 +177,20 @@ class RagStore:
         if not ENABLE_PGVECTOR or Vector is None:
             return None
 
-        query_embedding = self._build_embedding(query)
+        if not query.strip():
+            return None
 
         try:
+            query_embedding = self._build_embedding(query)
             statement = text(
-                """
+                f"""
                 SELECT id, source_type, source_id, workflow_name, failure_class, text, quality_score
                 FROM rag_chunks
                 WHERE (:source_type IS NULL OR source_type = :source_type)
                   AND (:workflow_name IS NULL OR workflow_name = :workflow_name)
-                                ORDER BY embedding <-> CAST(:embedding AS vector(32)) ASC,
+                  AND semantic_embedding IS NOT NULL
+                  AND embedding_model = :embedding_model
+                ORDER BY semantic_embedding <-> CAST(:embedding AS vector({RAG_EMBEDDING_DIMENSIONS})) ASC,
                          quality_score DESC,
                          created_at DESC
                 LIMIT :limit
@@ -163,10 +203,11 @@ class RagStore:
                     "workflow_name": workflow_name,
                     "embedding": f"[{','.join(f'{value:.6f}' for value in query_embedding)}]",
                     "limit": limit,
+                    "embedding_model": RAG_EMBEDDING_MODEL,
                 },
             )
 
-            return [
+            results = [
                 {
                     "source_type": row.source_type,
                     "source_id": row.source_id,
@@ -177,8 +218,10 @@ class RagStore:
                 }
                 for row in rows
             ]
+            # Unindexed legacy records remain available through SQL fallback.
+            return results or None
         except Exception as exc:  # pragma: no cover - depends on DB extension availability
-            print(f"[rag] vector search unavailable, falling back to SQL: {exc}", flush=True)
+            print(f"[rag] vector search unavailable, falling back to SQL ({type(exc).__name__})", flush=True)
             # Reset failed transaction state before running SQL fallback queries.
             session.rollback()
             return None
