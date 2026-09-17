@@ -1,5 +1,6 @@
 from pathlib import Path
 import sys
+import json
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -10,9 +11,23 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from openai import APITimeoutError
+from openai.types.responses import ResponseFunctionToolCall, ResponseReasoningItem
 
 from app.services.openai_reasoner import OpenAIReasoner
 from app.models.evidence import RawLog
+
+
+def function_response(name, arguments, call_id="call_test"):
+    return SimpleNamespace(
+        output_text="",
+        output=[
+            ResponseReasoningItem(id="rs_test", summary=[], type="reasoning"),
+            ResponseFunctionToolCall(
+                type="function_call", name=name, call_id=call_id,
+                arguments=json.dumps(arguments),
+            ),
+        ],
+    )
 
 
 @dataclass
@@ -25,11 +40,78 @@ class FakeRunRef:
 
 
 class OpenAIReasonerTimeoutTests(unittest.TestCase):
+    def test_native_function_schemas_preserve_nullable_defaults(self):
+        reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+        reasoner.tools = Mock()
+        schemas = reasoner._function_tools()
+        self.assertEqual({tool["name"] for tool in schemas}, {
+            "get_failed_logs", "get_commit_diff", "get_last_green_run",
+            "rerun_job", "search_playbook",
+        })
+        for tool in schemas:
+            self.assertTrue(tool["strict"])
+            parameters = tool["parameters"]
+            self.assertFalse(parameters["additionalProperties"])
+            self.assertEqual(set(parameters["required"]), set(parameters["properties"]))
+            for name, schema in parameters["properties"].items():
+                if name != "reason":
+                    self.assertIn("null", schema["type"])
+
+    def test_rejects_invalid_native_calls_before_executing_tools(self):
+        reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+        reasoner.client = Mock()
+        reasoner.tools = Mock()
+        multiple = function_response("rerun_job", {"run_id": 123})
+        multiple.output.append(multiple.output[-1])
+        malformed = function_response("rerun_job", {})
+        malformed.output[-1].arguments = "{invalid"
+        for response in [
+            multiple, malformed,
+            function_response("rerun_job", []),
+            SimpleNamespace(output=[], output_text=json.dumps({
+                "action": "tool_call", "tool": "rerun_job", "args": {},
+            })),
+        ]:
+            with self.subTest(response=response):
+                reasoner.client.responses.create.return_value = response
+                with self.assertRaises(ValueError):
+                    reasoner._request_action("test", [])
+        reasoner.tools.rerun_job.assert_not_called()
+
+    def test_function_output_keeps_existing_observation_budget(self):
+        reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+        reasoner.OBSERVATIONS_BUDGET_CHARS = 80
+        output = reasoner._tool_output({"call_id": "call_1"}, {"result": "x" * 200})
+        self.assertEqual(output["call_id"], "call_1")
+        self.assertIn("[truncated]", output["output"])
+        self.assertLess(len(output["output"]), 110)
+
+    def test_controlled_native_tool_failure_still_abstains(self):
+        reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
+        reasoner.client = Mock()
+        reasoner.tools = Mock()
+        reasoner.controlled_agent_mode = True
+        reasoner.max_reasoning_turns = 4
+        reasoner.client.responses.create.return_value = function_response(
+            "get_failed_logs", {"run_id": None, "reason": "need logs"}
+        )
+        reasoner.tools.get_failed_logs.side_effect = RuntimeError("log fetch failed")
+        evidence = SimpleNamespace(
+            run_id=123, workflow_name="ci", branch="main", sha="abc",
+            failed_jobs=["tests"], last_green_run_id=None,
+        )
+        result = reasoner.generate(evidence)
+        self.assertTrue(result["abstained"])
+        self.assertEqual(result["reasoning_trace"][-1]["reason"], "tool_call_failed")
+        reasoner.tools.get_failed_logs.assert_called_once_with(123)
+        self.assertEqual(reasoner.client.responses.create.call_count, 1)
+
     def test_generate_returns_fallback_when_request_times_out(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
         reasoner.client = Mock()
         reasoner.tools = None
         reasoner.controlled_agent_mode = False
+        reasoner.max_reasoning_turns = 4
         reasoner.client.responses.create.side_effect = APITimeoutError(request=SimpleNamespace())
 
         evidence = SimpleNamespace(
@@ -73,7 +155,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         ]
 
         reasoner.client.responses.create.return_value = SimpleNamespace(
-            output_text=(
+            output=[], output_text=(
                 '{"failure_class":"test","summary":"s","claims":[],'
                 '"suggested_next_step":"n","confidence":0.9,"abstained":false}'
             )
@@ -129,15 +211,9 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         ]
 
         reasoner.client.responses.create.side_effect = [
+            function_response('search_playbook', {'query': 'pytest assertion', 'limit': 3, 'reason': 'Need similar failures'}),
             SimpleNamespace(
-                output_text=(
-                    '{"action":"tool_call","tool":"search_playbook",'
-                    '"args":{"query":"pytest assertion","limit":3},'
-                    '"reason":"Need similar failures"}'
-                )
-            ),
-            SimpleNamespace(
-                output_text=(
+                output=[], output_text=(
                     '{"action":"final","rca":'
                     '{"failure_class":"test","summary":"s","claims":[],'
                     '"suggested_next_step":"n","confidence":0.8,"abstained":false}}'
@@ -169,7 +245,14 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         self.assertEqual(reasoner.tools.search_playbook.call_count, 2)
 
         _, kwargs = reasoner.client.responses.create.call_args
-        self.assertIn("pytest failure usually maps to assertion mismatch", kwargs["input"])
+        self.assertIn("pytest failure usually maps to assertion mismatch", kwargs["input"][0]["content"])
+        self.assertFalse(kwargs["parallel_tool_calls"])
+        self.assertEqual(kwargs["input"][1].type, "reasoning")
+        call = kwargs["input"][2]
+        output = kwargs["input"][3]
+        self.assertEqual(output["type"], "function_call_output")
+        self.assertEqual(output["call_id"], call.call_id)
+        self.assertEqual(json.loads(output["output"])["result"]["query"], "pytest assertion")
 
     def test_controlled_mode_requires_log_and_rag_evidence_before_final(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
@@ -200,28 +283,17 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
 
         reasoner.client.responses.create.side_effect = [
             SimpleNamespace(
-                output_text=(
+                output=[], output_text=(
                     '{"action":"final","rca":'
                     '{"failure_class":"test","summary":"early",'
                     '"claims":[],"suggested_next_step":"n",'
                     '"confidence":0.9,"abstained":false}}'
                 )
             ),
+            function_response('get_failed_logs', {'reason': 'need raw evidence'}),
+            function_response('search_playbook', {'query': 'ci unit-tests', 'limit': 5, 'reason': 'need historical context'}),
             SimpleNamespace(
-                output_text=(
-                    '{"action":"tool_call","tool":"get_failed_logs",'
-                    '"args":{},"reason":"need raw evidence"}'
-                )
-            ),
-            SimpleNamespace(
-                output_text=(
-                    '{"action":"tool_call","tool":"search_playbook",'
-                    '"args":{"query":"ci unit-tests","limit":5},'
-                    '"reason":"need historical context"}'
-                )
-            ),
-            SimpleNamespace(
-                output_text=(
+                output=[], output_text=(
                     '{"action":"final","rca":'
                     '{"failure_class":"test","summary":"grounded",'
                     '"claims":[],"suggested_next_step":"fix test",'
@@ -250,6 +322,13 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         self.assertEqual(trace[0].get("event"), "final_blocked")
         self.assertEqual(trace[1]["tool_request"]["tool"], "get_failed_logs")
         self.assertEqual(trace[2]["tool_request"]["tool"], "search_playbook")
+        self.assertEqual(trace[1]["tool_request"]["reason"], "need raw evidence")
+        requests = reasoner.client.responses.create.call_args_list
+        for request, expected_tool in zip(requests[2:], ["get_failed_logs", "search_playbook"]):
+            items = request.kwargs["input"]
+            self.assertEqual(items[2].name, expected_tool)
+            self.assertEqual(items[3]["call_id"], items[2].call_id)
+            self.assertEqual(json.loads(items[3]["output"])["tool"], expected_tool)
 
     def test_execute_tool_call_routes_all_documented_tools(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
@@ -348,7 +427,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         reasoner.OBSERVATIONS_BUDGET_CHARS = 120
 
         reasoner.client.responses.create.return_value = SimpleNamespace(
-            output_text=(
+            output=[], output_text=(
                 '{"failure_class":"test","summary":"s","claims":[],'
                 '"suggested_next_step":"n","confidence":0.9,"abstained":false}'
             )
@@ -391,7 +470,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         reasoner.OBSERVATIONS_BUDGET_CHARS = 4000
 
         reasoner.client.responses.create.return_value = SimpleNamespace(
-            output_text=(
+            output=[], output_text=(
                 '{"action":"final","rca":'
                 '{"failure_class":"test","summary":"early",'
                 '"claims":[],"suggested_next_step":"n",'
@@ -440,21 +519,10 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         reasoner.tools.search_playbook.return_value = []
 
         reasoner.client.responses.create.side_effect = [
+            function_response('get_failed_logs', {'reason': 'need logs'}),
+            function_response('search_playbook', {'query': 'ci unit-tests', 'limit': 5, 'reason': 'check historical matches'}),
             SimpleNamespace(
-                output_text=(
-                    '{"action":"tool_call","tool":"get_failed_logs",'
-                    '"args":{},"reason":"need logs"}'
-                )
-            ),
-            SimpleNamespace(
-                output_text=(
-                    '{"action":"tool_call","tool":"search_playbook",'
-                    '"args":{"query":"ci unit-tests","limit":5},'
-                    '"reason":"check historical matches"}'
-                )
-            ),
-            SimpleNamespace(
-                output_text=(
+                output=[], output_text=(
                     '{"action":"final","rca":'
                     '{"failure_class":"test","summary":"grounded without rag hit",'
                     '"claims":[],"suggested_next_step":"fix test",'
@@ -500,21 +568,10 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         reasoner.tools.search_playbook.return_value = []
 
         reasoner.client.responses.create.side_effect = [
+            function_response('get_failed_logs', {'run_id': 29178292575, 'reason': 'need logs'}),
+            function_response('search_playbook', {'query': 'ci unit-tests', 'limit': 5, 'reason': 'check historical matches'}),
             SimpleNamespace(
-                output_text=(
-                    '{"action":"tool_call","tool":"get_failed_logs",'
-                    '"args":{"run_id":29178292575},"reason":"need logs"}'
-                )
-            ),
-            SimpleNamespace(
-                output_text=(
-                    '{"action":"tool_call","tool":"search_playbook",'
-                    '"args":{"query":"ci unit-tests","limit":5},'
-                    '"reason":"check historical matches"}'
-                )
-            ),
-            SimpleNamespace(
-                output_text=(
+                output=[], output_text=(
                     '{"action":"final","rca":'
                     '{"failure_class":"test","summary":"s",'
                     '"claims":[],"suggested_next_step":"n",'

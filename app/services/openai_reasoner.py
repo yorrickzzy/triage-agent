@@ -34,6 +34,90 @@ class OpenAIReasoner:
             "abstained": True,
         }
 
+    def _function_tools(self) -> list[dict]:
+        if self.tools is None:
+            return []
+
+        definitions = [
+            ("get_failed_logs", "Fetch failed-job logs. Null run_id uses the current run.",
+             {"run_id": {"type": ["integer", "null"]}}),
+            ("get_commit_diff", "Fetch a commit diff. Null sha uses the current commit.",
+             {"sha": {"type": ["string", "null"]}}),
+            ("get_last_green_run", "Find the last successful run. Null values use task metadata.",
+             {"workflow_id": {"type": ["integer", "string", "null"]},
+              "branch": {"type": ["string", "null"]},
+              "current_run_id": {"type": ["integer", "null"]}}),
+            ("rerun_job", "Rerun failed jobs to validate suspected flakiness. Null run_id uses the current run.",
+             {"run_id": {"type": ["integer", "null"]}}),
+            ("search_playbook", "Search historical failures. Null query uses task metadata; null limit uses 5.",
+             {"query": {"type": ["string", "null"]},
+              "limit": {"type": ["integer", "null"]}}),
+        ]
+        tools = []
+        for name, description, properties in definitions:
+            properties["reason"] = {
+                "type": "string",
+                "description": "Brief purpose of this tool call for the reasoning trace.",
+            }
+            tools.append({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": list(properties),
+                    "additionalProperties": False,
+                },
+            })
+        return tools
+
+    def _request_action(self, prompt: str, tool_exchange: list) -> tuple[dict, list]:
+        # Earlier observations remain in the budgeted prompt. Replay the latest
+        # exchange, including reasoning items, to pair native calls and outputs.
+        response = self.client.responses.create(
+            model=OPENAI_MODEL,
+            input=([{"role": "user", "content": prompt}] + tool_exchange
+                   if tool_exchange else prompt),
+            tools=self._function_tools(),
+            parallel_tool_calls=False,
+        )
+        output = list(response.output)
+        calls = [item for item in output if item.type == "function_call"]
+        if len(calls) > 1:
+            raise ValueError("At most one tool call is allowed per turn")
+        if calls:
+            call = calls[0]
+            args = json.loads(call.arguments)
+            if not isinstance(args, dict):
+                raise ValueError("Function arguments must be a JSON object")
+            reason = args.pop("reason", "")
+            return {
+                "action": "tool_call",
+                "tool": call.name,
+                "args": args,
+                "reason": reason,
+                "call_id": call.call_id,
+            }, output
+
+        payload = json.loads(response.output_text)
+        if not isinstance(payload, dict):
+            raise ValueError("Final RCA must be a JSON object")
+        if payload.get("action") == "tool_call":
+            raise ValueError("Tool requests must use native function calling")
+        return payload, []
+
+    def _tool_output(self, payload: dict, result: dict) -> dict:
+        output, _ = self._truncate_text(
+            json.dumps(result, ensure_ascii=False), self.OBSERVATIONS_BUDGET_CHARS
+        )
+        return {
+            "type": "function_call_output",
+            "call_id": payload["call_id"],
+            "output": output,
+        }
+
     def _format_log_with_line_numbers(self, raw_log) -> str:
         return "\n".join(
             f"{i + 1} | {line}"
@@ -286,17 +370,8 @@ You are a CI/CD triage agent running in controlled tool-first mode.
 
 {strict_instruction}
 
-You may reason in multiple turns. Return ONLY valid JSON in one of these forms:
-
-1) Request a tool call
-{{
-    "action": "tool_call",
-    "tool": "get_failed_logs|get_commit_diff|get_last_green_run|rerun_job|search_playbook",
-    "args": {{ ... }},
-    "reason": "..."
-}}
-
-2) Return final RCA
+You may reason in multiple turns. Request tools using native function calls.
+For the final RCA, return ONLY valid JSON in this form:
 {{
     "action": "final",
     "rca": {{
@@ -526,20 +601,8 @@ You are a CI/CD triage agent.
 
 {strict_instruction}
 
-You may reason in multiple turns. Return ONLY valid JSON in one of these forms:
-
-1) Request a tool call
-{{
-    "action": "tool_call",
-    "tool": "search_playbook",
-    "args": {{
-        "query": "...",
-        "limit": 5
-    }},
-    "reason": "..."
-}}
-
-2) Return final RCA
+You may reason in multiple turns. Request tools using native function calls.
+For the final RCA, return ONLY valid JSON in this form:
 {{
     "action": "final",
     "rca": {{
@@ -692,6 +755,7 @@ Previous tool observations:
         if prefetch_observation is not None:
             observations.append(prefetch_observation)
 
+        tool_exchange: list = []
         for _ in range(self.max_reasoning_turns):
             rag_raw = self._format_rag_context(current_context)
             rag_text, rag_truncated = self._truncate_text(
@@ -728,11 +792,7 @@ Previous tool observations:
                 truncation_status=truncation_status,
             )
 
-            response = self.client.responses.create(
-                model=OPENAI_MODEL,
-                input=prompt,
-            )
-            payload = json.loads(response.output_text)
+            payload, tool_exchange = self._request_action(prompt, tool_exchange)
 
             # Backward compatibility: allow direct RCA output without action wrapper.
             if self._is_rca_payload(payload):
@@ -748,6 +808,7 @@ Previous tool observations:
                 )
 
             tool_result = self._execute_tool_call(evidence, payload)
+            tool_exchange.append(self._tool_output(payload, tool_result))
             observations.append(
                 {
                     "tool_request": {
@@ -809,6 +870,7 @@ Previous tool observations:
         has_rag_evidence = False
         evidence_tool_calls = 0
 
+        tool_exchange: list = []
         for _ in range(self.max_reasoning_turns):
             observations_raw = "None"
             if observations:
@@ -833,11 +895,7 @@ Previous tool observations:
                 evidence_tool_calls=evidence_tool_calls,
             )
 
-            response = self.client.responses.create(
-                model=OPENAI_MODEL,
-                input=prompt,
-            )
-            payload = json.loads(response.output_text)
+            payload, tool_exchange = self._request_action(prompt, tool_exchange)
 
             # Backward compatibility: direct RCA payload is treated as final action.
             if self._is_rca_payload(payload):
@@ -920,6 +978,7 @@ Previous tool observations:
                     },
                 }
             tool_result = self._execute_tool_call(evidence, payload)
+            tool_exchange.append(self._tool_output(payload, tool_result))
             observations.append(
                 {
                     "tool_request": {
