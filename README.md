@@ -21,7 +21,6 @@ The service is designed to fail safely: it redacts sensitive data before reasoni
 - Includes unit/integration scripts and an offline replay harness for evaluation
 - Persists task and agent checkpoints, resumes interrupted work, and skips confirmed deliveries
 
-See [task recovery and operator commands](docs/agent-checkpoints.md) for retry and review procedures.
 
 ## How It Works
 
