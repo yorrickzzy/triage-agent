@@ -1,8 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Literal
 
 from app.core.telemetry import record_exception, set_span_attributes, tracer
 from app.services.github_client import GitHubRerunTimeoutError
+from app.models.evidence import Evidence, RawLog
+from app.services.recovery_errors import ManualReviewRequired
+from app.services.confidence_gate import GateResult
 
 TriageAction = Literal[
     "pending",
@@ -33,6 +36,7 @@ class TriageService:
         incident_store,
         rag_store=None,
         tools=None,
+        task_queue=None,
     ):
         self.evidence_collector = evidence_collector
         self.rca_pipeline = rca_pipeline
@@ -44,12 +48,27 @@ class TriageService:
         self.incident_store = incident_store
         self.rag_store = rag_store
         self.tools = tools
+        self.task_queue = task_queue
 
     
 
-    def triage(self, run_id: int) -> TriageResult:
+    def triage(self, run_id: int, execution=None) -> TriageResult:
+        if execution is None and self.task_queue is not None:
+            from app.models.triage_job import TriageJob
+            from app.services.triage_worker import process_task
+            run = self.github_client.get_workflow_run(run_id)
+            key = self.task_queue.enqueue(TriageJob(
+                run_id, run["name"], run["head_branch"], run["head_sha"],
+                int(run.get("run_attempt", 1))))
+            task = self.task_queue.inspect(key)
+            if task["status"] == "completed":
+                return TriageResult(**task["result"])
+            execution = self.task_queue.claim(key)
+            if execution is None:
+                raise RuntimeError(f"Task {key} is {task['status']}; inspect it before retrying")
+            return process_task(self, execution)
         if tracer is None:
-            return self._triage_impl(run_id)
+            return self._triage_impl(run_id, execution=execution)
 
         with tracer.start_as_current_span("triage.service") as span:
             try:
@@ -57,7 +76,7 @@ class TriageService:
                     span,
                     run_id=run_id,
                 )
-                result = self._triage_impl(run_id)
+                result = self._triage_impl(run_id, execution=execution)
                 set_span_attributes(
                     span,
                     action=result.action,
@@ -68,25 +87,48 @@ class TriageService:
                 record_exception(span, exc)
                 raise
 
-    def _triage_impl(self, run_id: int) -> TriageResult:
-        evidence = self.evidence_collector.collect(run_id)
+    def _triage_impl(self, run_id: int, execution=None) -> TriageResult:
+        if execution is None:
+            evidence = self.evidence_collector.collect(run_id)
+        else:
+            def collect():
+                snapshot = self.evidence_collector.collect(run_id)
+                if snapshot.run_attempt != execution.payload["run_attempt"]:
+                    raise ManualReviewRequired("CI attempt changed before evidence was collected")
+                return asdict(snapshot)
+            snapshot = execution.step("evidence", collect)
+            evidence = Evidence(**{**snapshot, "logs": [RawLog(**log) for log in snapshot["logs"]]})
         rag_context = []
         if self.rag_store is not None:
-            rag_context = self.rag_store.retrieve_for_evidence(evidence)
+            operation = lambda: self.rag_store.retrieve_for_evidence(evidence)
+            rag_context = execution.step("rag", operation) if execution else operation()
 
-        rca = self.rca_pipeline.run(
-            evidence,
-            rag_context=rag_context,
-        )
-        gate_result = self.confidence_gate.evaluate(rca)
+        operation = lambda: self.rca_pipeline.run(evidence, rag_context=rag_context,
+            **({"execution": execution} if execution else {}))
+        rca = execution.step("rca", operation) if execution else operation()
+        if execution:
+            def evaluate():
+                result = self.confidence_gate.evaluate(rca)
+                return {"decision": result.decision, "reason": result.reason}
+            gate_result = GateResult(**execution.step("gate", evaluate))
+        else:
+            gate_result = self.confidence_gate.evaluate(rca)
 
-        incident = self.incident_store.create_incident(
-            evidence=evidence,
-            rca=rca,
-        )
+        if execution:
+            incident_id = execution.step("incident", lambda session:
+                self.incident_store.create_in_transaction(session, evidence=evidence, rca=rca),
+                transactional=True)
+            incident = self.incident_store.get_by_id(incident_id)
+        else:
+            incident = self.incident_store.create_incident(evidence=evidence, rca=rca)
 
         if self.rag_store is not None:
-            self.rag_store.index_incident(incident)
+            if execution:
+                payload = execution.step("incident_embedding", lambda: self.rag_store.prepare_incident(incident))
+                execution.step("index_incident", lambda session:
+                    self.rag_store.index_prepared_incident(session, payload), transactional=True)
+            else:
+                self.rag_store.index_incident(incident)
 
         try:
             if gate_result.decision == "rerun":
@@ -95,6 +137,7 @@ class TriageService:
                     suspected_rca=rca,
                     evidence=evidence,
                     incident_id=incident.id,
+                    execution=execution,
                 )
 
             elif gate_result.decision == "abstain":
@@ -106,6 +149,7 @@ class TriageService:
                     rca=abstain_rca,
                     reason=gate_result.reason,
                     incident_id=incident.id,
+                    execution=execution,
                 )
                 # Mark the action as abstain (not delivered)
                 result.action = "abstain"
@@ -116,19 +160,28 @@ class TriageService:
                     rca=rca,
                     reason=gate_result.reason,
                     incident_id=incident.id,
+                    execution=execution,
                 )
 
-            self.incident_store.update_delivery(
-                incident_id=incident.id,
-                action=result.action,
-                decision_reason=result.reason,
-                comment_url=result.comment_url,
-            )
+            if execution:
+                def update_incident(session):
+                    from app.models.incident import Incident
+                    row = session.get(Incident, incident.id)
+                    row.action, row.decision_reason = result.action, result.reason
+                    row.comment_url = result.comment_url
+                    return row.id
+                execution.step("incident_delivery", update_incident, transactional=True)
+            else:
+                self.incident_store.update_delivery(
+                    incident_id=incident.id, action=result.action,
+                    decision_reason=result.reason, comment_url=result.comment_url)
 
             result.incident_id = incident.id
             return result
 
         except Exception as exc:
+            if execution:
+                raise  # Task status records failures and review requirements.
             self.incident_store.update_delivery(
                 incident_id=incident.id,
                 action="delivery_failed",
@@ -145,21 +198,20 @@ class TriageService:
         rca: dict,
         reason: str,
         incident_id: int,
+        execution=None,
     ) -> TriageResult:
-        markdown = self.report_formatter.to_markdown(
-            evidence=evidence,
-            rca=rca,
-            incident_id=incident_id,
-        )
+        operation = lambda: self.report_formatter.to_markdown(
+            evidence=evidence, rca=rca, incident_id=incident_id)
+        markdown = execution.step("markdown", operation) if execution else operation()
 
         comment_url = None
         reference_url = self.github_client.build_run_url(evidence.run_id)
 
         if evidence.pull_request_number is not None:
-            delivery_result = self.github_delivery.deliver(
-                pull_request_number=evidence.pull_request_number,
-                markdown=markdown,
-            )
+            operation = lambda: self.github_delivery.deliver(
+                pull_request_number=evidence.pull_request_number, markdown=markdown)
+            delivery_result = (execution.step("github_comment", operation, effect=True)
+                               if execution else operation())
 
             comment_url = (
                 delivery_result.get("html_url")
@@ -169,10 +221,10 @@ class TriageService:
             if comment_url:
                 reference_url = comment_url
         else:
-            delivery_result = self.github_delivery.deliver_commit_comment(
-                sha=evidence.sha,
-                markdown=markdown,
-            )
+            operation = lambda: self.github_delivery.deliver_commit_comment(
+                sha=evidence.sha, markdown=markdown)
+            delivery_result = (execution.step("github_comment", operation, effect=True)
+                               if execution else operation())
             comment_url = (
                 delivery_result.get("html_url")
                 or delivery_result.get("url")
@@ -183,15 +235,16 @@ class TriageService:
             else:
                 reference_url = self.github_client.build_commit_url(evidence.sha)
 
-        slack_message = self.report_formatter.to_slack(
-            evidence=evidence,
-            rca=rca,
-            incident_id=incident_id,
-            comment_url=comment_url,
-            reference_url=reference_url,
-        )
+        operation = lambda: self.report_formatter.to_slack(
+            evidence=evidence, rca=rca, incident_id=incident_id,
+            comment_url=comment_url, reference_url=reference_url)
+        slack_message = execution.step("slack_text", operation) if execution else operation()
 
-        self.slack_client.send_message(slack_message)
+        operation = lambda: self.slack_client.send_message(slack_message)
+        if execution:
+            execution.step("slack_message", operation, effect=True)
+        else:
+            operation()
 
         return TriageResult(
             action="delivered",
@@ -207,11 +260,19 @@ class TriageService:
         suspected_rca: dict,
         evidence,
         incident_id: int,
+        execution=None,
     ) -> TriageResult:
-        original_run = self.github_client.get_workflow_run(run_id)
+        def operation():
+            run = self.github_client.get_workflow_run(run_id)
+            if execution and int(run.get("run_attempt", 1)) != evidence.run_attempt:
+                raise ManualReviewRequired("CI attempt changed before flaky rerun")
+            return run
+        original_run = execution.step("pre_rerun", operation) if execution else operation()
         previous_attempt = int(original_run.get("run_attempt", 1))
 
-        accepted = self.github_client.rerun_failed_jobs(run_id)
+        operation = lambda: self.github_client.rerun_failed_jobs(run_id)
+        accepted = (execution.step("flaky_rerun", operation, effect=True)
+                    if execution else operation())
 
         if not accepted:
             return TriageResult(
@@ -223,13 +284,13 @@ class TriageService:
             )
 
         try:
-            rerun = self.github_client.wait_for_new_attempt_completion(
-                run_id=run_id,
-                previous_attempt=previous_attempt,
-                timeout_seconds=300,
-                poll_interval_seconds=5,
-            )
+            operation = lambda: self.github_client.wait_for_new_attempt_completion(
+                run_id=run_id, previous_attempt=previous_attempt,
+                timeout_seconds=300, poll_interval_seconds=5)
+            rerun = execution.step("rerun_result", operation) if execution else operation()
         except GitHubRerunTimeoutError:
+            if execution:
+                raise  # Retry the wait using the saved baseline, without another rerun.
             return TriageResult(
                 action="rerun_pending",
                 rca=suspected_rca,
@@ -280,6 +341,7 @@ class TriageService:
                 rca=confirmed_rca,
                 reason="Flakiness confirmed by a successful rerun.",
                 incident_id=incident_id,
+                execution=execution,
             )
 
         return TriageResult(

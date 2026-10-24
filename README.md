@@ -19,6 +19,9 @@ The service is designed to fail safely: it redacts sensitive data before reasoni
 - Reuses previous incidents as RAG context; optionally uses PostgreSQL with pgvector
 - Exposes OpenTelemetry traces and includes Jaeger in the Docker Compose stack
 - Includes unit/integration scripts and an offline replay harness for evaluation
+- Persists task and agent checkpoints, resumes interrupted work, and skips confirmed deliveries
+
+See [task recovery and operator commands](docs/agent-checkpoints.md) for retry and review procedures.
 
 ## How It Works
 
@@ -29,7 +32,7 @@ GitHub Actions failure
 Signed workflow_run webhook
         |
         v
-In-memory job queue and background worker
+Database task table and single background worker (restart recovery)
         |
         v
 Evidence collection -> redaction -> historical incident retrieval
@@ -273,7 +276,7 @@ docker compose exec postgres psql -U chamber -d chamber -c "SELECT embedding_mod
 
 ## Operational Notes
 
-- The job queue is in memory. Pending jobs are lost when the process restarts, and the current design is intended for a single application process.
+- Run one application process and one background worker. Startup resumes interrupted tasks; ordinary failures require an explicit retry, and uncertain external sends require review.
 - Schema creation and small compatibility migrations run at startup; there is no external migration framework yet.
 - When pgvector is unavailable or disabled, retrieval falls back to SQL keyword matching.
 - Traces are written to the console and exported through OTLP/HTTP.

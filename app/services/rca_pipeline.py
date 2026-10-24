@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 from app.core.telemetry import record_exception, set_span_attributes, tracer
 
 
@@ -7,19 +9,19 @@ class RCAPipeline:
         self.classifier = classifier
         self.verifier = verifier
 
-    def run(self, evidence, rag_context: list[dict] | None = None) -> dict:
+    def run(self, evidence, rag_context: list[dict] | None = None, execution=None) -> dict:
         if tracer is None:
-            return self._run_impl(evidence, rag_context=rag_context)
+            return self._run_impl(evidence, rag_context=rag_context, execution=execution)
 
         with tracer.start_as_current_span("grounding.verify") as span:
             try:
                 set_span_attributes(
                     span,
-                    run_id=evidence.run_id,
-                    workflow_name=evidence.workflow_name,
-                    branch=evidence.branch,
+                    run_id=getattr(evidence, "run_id", None),
+                    workflow_name=getattr(evidence, "workflow_name", None),
+                    branch=getattr(evidence, "branch", None),
                 )
-                result = self._run_impl(evidence, rag_context=rag_context)
+                result = self._run_impl(evidence, rag_context=rag_context, execution=execution)
                 set_span_attributes(
                     span,
                     failure_class=result.get("failure_class"),
@@ -31,16 +33,17 @@ class RCAPipeline:
                 record_exception(span, exc)
                 raise
 
-    def _run_impl(self, evidence, rag_context: list[dict] | None = None) -> dict:
-        with tracer.start_as_current_span("agent.reasoning") as span:
+    def _run_impl(self, evidence, rag_context: list[dict] | None = None, execution=None) -> dict:
+        with (tracer.start_as_current_span("agent.reasoning") if tracer else nullcontext()) as span:
             first_rca = self.reasoner.generate(
                 evidence,
                 rag_context=rag_context,
+                **({"checkpoint": execution.checkpoint()} if execution else {}),
             )
             set_span_attributes(
                 span,
-                run_id=evidence.run_id,
-                workflow_name=evidence.workflow_name,
+                run_id=getattr(evidence, "run_id", None),
+                workflow_name=getattr(evidence, "workflow_name", None),
                 strict_grounding=False,
             )
             first_rca = self.classifier.normalize(first_rca)
@@ -50,16 +53,17 @@ class RCAPipeline:
 
         print("[pipeline] grounding failed, regenerating once...", flush=True)
 
-        with tracer.start_as_current_span("agent.reasoning") as span:
+        with (tracer.start_as_current_span("agent.reasoning") if tracer else nullcontext()) as span:
             second_rca = self.reasoner.generate(
                 evidence,
                 rag_context=rag_context,
                 strict_grounding=True,
+                **({"checkpoint": execution.checkpoint(strict=True)} if execution else {}),
             )
             set_span_attributes(
                 span,
-                run_id=evidence.run_id,
-                workflow_name=evidence.workflow_name,
+                run_id=getattr(evidence, "run_id", None),
+                workflow_name=getattr(evidence, "workflow_name", None),
                 strict_grounding=True,
             )
             second_rca = self.classifier.normalize(second_rca)

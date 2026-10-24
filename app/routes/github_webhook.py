@@ -69,15 +69,17 @@ async def github_webhook(request: Request):
                 workflow=workflow_name,
                 branch=branch,
                 sha=sha,
+                run_attempt=int(workflow_run.get("run_attempt", 1)),
             )
 
-            enqueue_triage_job(job)
+            task_id = enqueue_triage_job(job)
 
             print(f"[webhook] queued triage job: run_id={run_id}", flush=True)
             set_span_attributes(span, decision="queued")
 
             return {
                 "status": "queued",
+                "task_id": task_id,
                 "run_id": run_id,
                 "workflow": workflow_name,
                 "branch": branch,
@@ -125,14 +127,16 @@ async def _github_webhook_impl(request: Request):
         workflow=workflow_name,
         branch=branch,
         sha=sha,
+        run_attempt=int(workflow_run.get("run_attempt", 1)),
     )
 
-    enqueue_triage_job(job)
+    task_id = enqueue_triage_job(job)
 
     print(f"[webhook] queued triage job: run_id={run_id}", flush=True)
 
     return {
         "status": "queued",
+        "task_id": task_id,
         "run_id": run_id,
         "workflow": workflow_name,
         "branch": branch,

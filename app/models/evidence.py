@@ -28,3 +28,4 @@ class Evidence:
     diff: str
     last_green_run_id: int | None
     pull_request_number: int | None
+    run_attempt: int = 1

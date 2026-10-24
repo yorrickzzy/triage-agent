@@ -1,49 +1,40 @@
 import threading
+from dataclasses import asdict
 
 from app.bootstrap import build_triage_service
-from app.services.job_queue import get_triage_job
 
 
-def worker_loop() -> None:
-    print("[worker] starting...", flush=True)
+def process_task(service, execution):
+    try:
+        result = service.triage(execution.payload["run_id"], execution=execution)
+        execution.complete(asdict(result))
+        return result
+    except Exception as exc:
+        execution.fail(exc)
+        raise
+
+
+def worker_loop(stop=None):
+    stop = stop or threading.Event()
     service = build_triage_service()
-    print("[worker] ready", flush=True)
-
-    while True:
-        job = get_triage_job()
-
-        print(
-            f"[worker] processing run {job.run_id}",
-            flush=True,
-        )
-
+    queue = service.task_queue
+    queue.recover_running()
+    print("[worker] ready (single worker)", flush=True)
+    while not stop.is_set():
         try:
-            result = service.triage(job.run_id)
-
-            print(
-                f"[worker] completed "
-                f"(action={result.action}, "
-                f"incident_id={result.incident_id})",
-                flush=True,
-            )
-
-            if result.comment_url:
-                print(
-                    f"[worker] comment_url={result.comment_url}",
-                    flush=True,
-                )
-
-        except Exception as e:
-            print(
-                f"[worker] failed for run_id={job.run_id}: {e}",
-                flush=True,
-            )
+            execution = queue.claim()
+            if execution is None:
+                stop.wait(1)
+                continue
+            result = process_task(service, execution)
+            print(f"[worker] completed task {execution.key}: {result.action}", flush=True)
+        except Exception as exc:
+            print(f"[worker] task failed: {exc}", flush=True)
+            stop.wait(1)
 
 
-def start_worker() -> None:
-    thread = threading.Thread(
-        target=worker_loop,
-        name="triage-worker",
-        daemon=True,
-    )
+def start_worker():
+    stop = threading.Event()
+    thread = threading.Thread(target=worker_loop, args=(stop,), name="triage-worker", daemon=True)
     thread.start()
+    return stop, thread

@@ -12,9 +12,12 @@ from app.routes.feedback import router as feedback_router
 async def lifespan(app: FastAPI):
     configure_telemetry(service_name="triage-agent")
     create_tables()
-    start_worker()
-
-    yield
+    stop, worker = start_worker()
+    try:
+        yield
+    finally:
+        stop.set()
+        worker.join(timeout=2)
 
 
 app = FastAPI(

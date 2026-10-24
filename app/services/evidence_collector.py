@@ -46,6 +46,10 @@ class EvidenceCollector:
             else None
         )
 
+        latest = self.github.get_workflow_run(run_id)
+        if int(latest.get("run_attempt", 1)) != int(run.get("run_attempt", 1)):
+            raise RuntimeError("CI attempt changed while collecting evidence; retry required")
+
         return Evidence(
             run_id=run["id"],
             workflow_name=run["name"],
@@ -56,6 +60,7 @@ class EvidenceCollector:
             diff=diff,
             last_green_run_id=last_green["id"] if last_green else None,
             pull_request_number=pull_request_number,
+            run_attempt=int(run.get("run_attempt", 1)),
         )
 
     def _collect_diff(self, sha: str) -> str:

@@ -1,10 +1,11 @@
 import json
 from dataclasses import asdict, is_dataclass
 
-from openai import APITimeoutError, OpenAI
+from openai import OpenAI
 
 from app.core.config import OPENAI_API_KEY, OPENAI_MODEL
 from app.core.telemetry import record_exception, set_span_attributes, tracer
+from app.services.recovery_errors import ManualReviewRequired
 
 
 class OpenAIReasoner:
@@ -841,6 +842,7 @@ Previous tool observations:
         evidence,
         strict_grounding: bool,
         rag_context: list[dict] | None,
+        checkpoint=None,
     ) -> dict:
         if self.tools is None:
             return self._controlled_abstain_result(
@@ -865,13 +867,30 @@ Previous tool observations:
         Cite only exact text copied from numbered logs.
         """
 
-        observations: list[dict] = []
-        has_log_evidence = False
-        has_rag_evidence = False
-        evidence_tool_calls = 0
+        state = checkpoint.state if checkpoint else {}
+        observations = state.get("observations", [])
+        has_log_evidence = state.get("has_log_evidence", False)
+        has_rag_evidence = state.get("has_rag_evidence", False)
+        evidence_tool_calls = state.get("evidence_tool_calls", 0)
+        tool_exchange = state.get("tool_exchange", [])
 
-        tool_exchange: list = []
-        for _ in range(self.max_reasoning_turns):
+        def save(turn, pending=None, tool_started=False):
+            if checkpoint:
+                checkpoint.save({
+                    "turn": turn, "observations": observations,
+                    "has_log_evidence": has_log_evidence,
+                    "has_rag_evidence": has_rag_evidence,
+                    "evidence_tool_calls": evidence_tool_calls,
+                    "tool_exchange": tool_exchange, "pending": pending,
+                    "tool_started": tool_started,
+                })
+
+        pending = state.get("pending")
+        if pending and state.get("tool_started") and pending.get("tool") == "rerun_job":
+            raise ManualReviewRequired(
+                f"Interrupted rerun_job has an uncertain outcome; manual reconciliation required "
+                f"for task {checkpoint.execution.key if checkpoint else 'unknown'}")
+        for turn in range(state.get("turn", 0), self.max_reasoning_turns):
             observations_raw = "None"
             if observations:
                 observations_raw = json.dumps(
@@ -895,7 +914,12 @@ Previous tool observations:
                 evidence_tool_calls=evidence_tool_calls,
             )
 
-            payload, tool_exchange = self._request_action(prompt, tool_exchange)
+            if pending is not None:
+                payload = pending
+                pending = None
+            else:
+                payload, tool_exchange = self._request_action(prompt, tool_exchange)
+                save(turn, pending=payload)
 
             # Backward compatibility: direct RCA payload is treated as final action.
             if self._is_rca_payload(payload):
@@ -922,6 +946,7 @@ Previous tool observations:
                         },
                     }
                 )
+                save(turn + 1)
                 continue
 
             action = payload.get("action")
@@ -949,6 +974,7 @@ Previous tool observations:
                         },
                     }
                 )
+                save(turn + 1)
                 continue
 
             if action != "tool_call":
@@ -977,7 +1003,17 @@ Previous tool observations:
                         "run_id": evidence.run_id,
                     },
                 }
-            tool_result = self._execute_tool_call(evidence, payload)
+            save(turn, pending=payload, tool_started=True)
+            if checkpoint and tool_name == "get_failed_logs":
+                tool_result = {"ok": True, "tool": tool_name,
+                               "result": self._serialize_raw_logs(evidence.logs)}
+            else:
+                tool_result = self._execute_tool_call(evidence, payload)
+            if checkpoint and not tool_result.get("ok"):
+                error = tool_result.get("error", "Tool failed")
+                if tool_name == "rerun_job":
+                    raise ManualReviewRequired(error)
+                raise RuntimeError(error)
             tool_exchange.append(self._tool_output(payload, tool_result))
             observations.append(
                 {
@@ -1021,6 +1057,8 @@ Previous tool observations:
                     # Treating this as "missing evidence" causes avoidable abstains.
                     has_rag_evidence = True
 
+            save(turn + 1)
+
         observations.append(
             {
                 "event": "controlled_mode_abstain",
@@ -1037,25 +1075,23 @@ Previous tool observations:
         )
 
     def generate(
-        self,
-        evidence,
-        rag_context: list[dict] | None = None,
-        strict_grounding: bool = False,
+        self, evidence, rag_context: list[dict] | None = None,
+        strict_grounding: bool = False, checkpoint=None,
     ) -> dict:
         try:
             if getattr(self, "controlled_agent_mode", False):
-                return self._generate_controlled_agent_mode(
-                    evidence=evidence,
-                    strict_grounding=strict_grounding,
-                    rag_context=rag_context,
-                )
-
+                if checkpoint and checkpoint.result is not None:
+                    return checkpoint.result
+                result = self._generate_controlled_agent_mode(
+                    evidence=evidence, strict_grounding=strict_grounding,
+                    rag_context=rag_context, checkpoint=checkpoint)
+                if checkpoint:
+                    checkpoint.complete(result)
+                return result
             return self._generate_workflow_mode(
-                evidence=evidence,
-                rag_context=rag_context,
-                strict_grounding=strict_grounding,
-            )
-        except APITimeoutError as exc:
-            return self._fallback_result(exc)
+                evidence=evidence, rag_context=rag_context,
+                strict_grounding=strict_grounding)
         except Exception as exc:
+            if checkpoint is not None:
+                raise
             return self._fallback_result(exc)

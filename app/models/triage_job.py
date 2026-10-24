@@ -7,3 +7,4 @@ class TriageJob:
     workflow: str
     branch: str
     sha: str
+    run_attempt: int = 1

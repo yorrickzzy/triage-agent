@@ -36,10 +36,15 @@ def get_db_session() -> Generator[Session, None, None]:
 
 
 def create_tables() -> None:
+    from app.models.triage_task import TriageTask  # noqa: F401
     # 必须先导入模型，SQLAlchemy 才知道有哪些表
     from app.models.feedback import Feedback  # noqa: F401
     from app.models.incident import Incident  # noqa: F401
     from app.models.rag_chunk import RagChunk  # noqa: F401
+    from app.core.task_migration import migrate_task_tables
+
+    with engine.begin() as connection:
+        migrate_task_tables(connection)
 
     if ENABLE_PGVECTOR:
         if engine.dialect.name != "postgresql":

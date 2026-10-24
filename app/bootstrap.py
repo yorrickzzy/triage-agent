@@ -13,6 +13,7 @@ from app.services.triage_service import TriageService
 from app.services.slack_client import SlackClient
 from app.services.incident_store import IncidentStore
 from app.services.rag_store import RagStore
+from app.services.job_queue import TaskQueue
 from app.services.triage_toolbelt import DefaultTriageToolbelt
 
 
@@ -59,4 +60,5 @@ def build_triage_service() -> TriageService:
         incident_store=incident_store,
         rag_store=rag_store,
         tools=toolbelt,
+        task_queue=TaskQueue(SessionLocal),
     )

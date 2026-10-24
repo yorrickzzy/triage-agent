@@ -59,6 +59,7 @@ class IncidentStore:
         action: str = "pending",
         decision_reason: str = "Delivery is pending.",
         comment_url: str | None = None,
+        session: Session | None = None,
     ) -> Incident:
         trace_payload = rca.get("reasoning_trace")
         reasoning_trace = None
@@ -88,12 +89,19 @@ class IncidentStore:
             reasoning_trace=reasoning_trace,
         )
 
-        with self.session_factory() as session:
+        if session is not None:
             session.add(incident)
-            session.commit()
-            session.refresh(incident)
+            session.flush()
+        else:
+            with self.session_factory() as session:
+                session.add(incident)
+                session.commit()
+                session.refresh(incident)
 
         return incident
+
+    def create_in_transaction(self, session, *, evidence, rca):
+        return self._create_incident_impl(session=session, evidence=evidence, rca=rca).id
 
     def get_by_id(self, incident_id: int) -> Incident | None:
         with self.session_factory() as session:

@@ -51,7 +51,7 @@ class RagStore:
 
         return embedding
 
-    def index_incident(self, incident) -> RagChunk:
+    def prepare_incident(self, incident) -> dict:
         text = (
             f"[incident #{incident.id}] "
             f"workflow={incident.workflow_name}; "
@@ -69,23 +69,32 @@ class RagStore:
         except Exception as exc:
             print(f"[rag] embedding unavailable ({type(exc).__name__}); saved for backfill", flush=True)
 
+        return {
+            "source_type": "incident", "source_id": incident.id,
+            "workflow_name": incident.workflow_name,
+            "failure_class": incident.failure_class, "text": text,
+            "semantic_embedding": self._serialize_embedding(embedding) if embedding is not None else None,
+            "embedding_model": RAG_EMBEDDING_MODEL if embedding is not None else None,
+            "quality_score": 0.0,
+        }
+
+    def index_prepared_incident(self, session, payload) -> int:
+        existing = session.scalars(select(RagChunk).where(
+            RagChunk.source_type == "incident", RagChunk.source_id == payload["source_id"]
+        )).first()
+        if existing is not None:
+            return existing.id
+        chunk = RagChunk(**payload)
+        session.add(chunk)
+        session.flush()
+        return chunk.id
+
+    def index_incident(self, incident) -> RagChunk:
+        payload = self.prepare_incident(incident)
         with self.session_factory() as session:
-            chunk = RagChunk(
-                source_type="incident",
-                source_id=incident.id,
-                workflow_name=incident.workflow_name,
-                failure_class=incident.failure_class,
-                text=text,
-                semantic_embedding=self._serialize_embedding(embedding) if embedding is not None else None,
-                embedding_model=RAG_EMBEDDING_MODEL if embedding is not None else None,
-                quality_score=0.0,
-            )
-
-            session.add(chunk)
+            chunk_id = self.index_prepared_incident(session, payload)
             session.commit()
-            session.refresh(chunk)
-
-            return chunk
+            return session.get(RagChunk, chunk_id)
 
     def reindex_embeddings(self) -> int:
         """Rebuild missing/outdated vectors; each commit is a resumable checkpoint."""
