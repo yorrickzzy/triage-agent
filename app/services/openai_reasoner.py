@@ -1,4 +1,5 @@
 import json
+import time
 from dataclasses import asdict, is_dataclass
 
 from openai import OpenAI
@@ -10,6 +11,7 @@ from app.services.recovery_errors import ManualReviewRequired
 
 class OpenAIReasoner:
     MAX_REASONING_TURNS = 4
+    MAX_INVESTIGATION_SECONDS = 120
     CONTROLLED_AGENT_MODE = True
     LOGS_BUDGET_CHARS = 10000
     DIFF_BUDGET_CHARS = 2500
@@ -20,7 +22,7 @@ class OpenAIReasoner:
     LOG_FALLBACK_HEAD_LINES = 120
 
     def __init__(self, tools=None):
-        self.client = OpenAI(api_key=OPENAI_API_KEY)
+        self.client = OpenAI(api_key=OPENAI_API_KEY, timeout=30.0, max_retries=1)
         self.tools = tools
         self.max_reasoning_turns = self.MAX_REASONING_TURNS
         self.controlled_agent_mode = self.CONTROLLED_AGENT_MODE
@@ -40,16 +42,17 @@ class OpenAIReasoner:
             return []
 
         definitions = [
-            ("get_failed_logs", "Fetch failed-job logs. Null run_id uses the current run.",
-             {"run_id": {"type": ["integer", "null"]}}),
+            ("get_failed_logs", "Read the sanitized current-run snapshot. Optional job_id and original line range select up to 80 lines; null range returns error windows.",
+             {"run_id": {"type": ["integer", "null"]},
+              "job_id": {"type": ["integer", "null"]},
+              "line_start": {"type": ["integer", "null"]},
+              "line_end": {"type": ["integer", "null"]}}),
             ("get_commit_diff", "Fetch a commit diff. Null sha uses the current commit.",
              {"sha": {"type": ["string", "null"]}}),
             ("get_last_green_run", "Find the last successful run. Null values use task metadata.",
              {"workflow_id": {"type": ["integer", "string", "null"]},
               "branch": {"type": ["string", "null"]},
               "current_run_id": {"type": ["integer", "null"]}}),
-            ("rerun_job", "Rerun failed jobs to validate suspected flakiness. Null run_id uses the current run.",
-             {"run_id": {"type": ["integer", "null"]}}),
             ("search_playbook", "Search historical failures. Null query uses task metadata; null limit uses 5.",
              {"query": {"type": ["string", "null"]},
               "limit": {"type": ["integer", "null"]}}),
@@ -74,7 +77,7 @@ class OpenAIReasoner:
             })
         return tools
 
-    def _request_action(self, prompt: str, tool_exchange: list) -> tuple[dict, list]:
+    def _request_action(self, prompt: str, tool_exchange: list, *, final_only: bool = False) -> tuple[dict, list]:
         # Earlier observations remain in the budgeted prompt. Replay the latest
         # exchange, including reasoning items, to pair native calls and outputs.
         response = self.client.responses.create(
@@ -82,6 +85,7 @@ class OpenAIReasoner:
             input=([{"role": "user", "content": prompt}] + tool_exchange
                    if tool_exchange else prompt),
             tools=self._function_tools(),
+            **({"tool_choice": "none"} if final_only else {}),
             parallel_tool_calls=False,
         )
         output = list(response.output)
@@ -367,7 +371,7 @@ class OpenAIReasoner:
         evidence_tool_calls: int,
     ) -> str:
         return f"""
-You are a CI/CD triage agent running in controlled tool-first mode.
+You are a CI/CD triage agent investigating a fixed evidence snapshot.
 
 {strict_instruction}
 
@@ -397,23 +401,19 @@ For the final RCA, return ONLY valid JSON in this form:
 }}
 
 Hard constraints:
+- Use the supplied sanitized evidence snapshot; do not fetch the same evidence again.
+- Call tools only when additional information materially reduces uncertainty.
+- Historical search is optional. Build queries from concrete errors, modules and symptoms.
+- Empty historical results do not require abstention. History is reference, not proof.
+- Cite exact current log text with original line numbers; every substantive claim needs citations.
+- If evidence is insufficient, return an abstained RCA instead of guessing.
+- Suspected flakiness is a recommendation; only the outer workflow may rerun jobs.
 - At most one tool call per turn.
-- Before returning final RCA, you must gather BOTH:
-  1) log evidence via get_failed_logs
-  2) historical evidence via search_playbook
-- If either evidence source is missing, request a tool call instead of final.
-- Call-order guidance:
-    1) If log evidence is missing, call get_failed_logs first.
-    2) If log evidence exists but historical evidence is missing, call search_playbook next.
-    3) Once both evidence requirements are satisfied, return final RCA if the current evidence is sufficient and grounded; otherwise request one additional tool call only when it materially reduces uncertainty.
-    4) Do not call extra tools unless they reduce uncertainty.
-- Never cite diff or historical context as primary evidence claims.
 
 Available tools:
-- get_failed_logs(run_id)
-- get_commit_diff(sha)
+- get_failed_logs(run_id, job_id, line_start, line_end): read the saved snapshot
+- get_commit_diff(sha): read the saved diff
 - get_last_green_run(workflow_id, branch, current_run_id)
-- rerun_job(run_id)
 - search_playbook(query, limit)
 
 Task metadata:
@@ -429,7 +429,7 @@ Evidence status:
 - evidence_tool_calls: {evidence_tool_calls}
 - observations_truncated: {str(observations_truncated).lower()}
 
-Tool observations (the only detailed context you currently have):
+Additional tool observations:
 {observations_text}
 """
 
@@ -505,7 +505,23 @@ Tool observations (the only detailed context you currently have):
         try:
             if tool_name == "get_failed_logs":
                 run_id = self._normalize_run_id(args.get("run_id"), evidence.run_id)
-                logs = self.tools.get_failed_logs(run_id)
+                if run_id != evidence.run_id:
+                    raise ValueError("Only the current evidence snapshot is available")
+                logs = evidence.logs
+                if args.get("job_id") is not None:
+                    logs = [log for log in logs if log.job_id == args["job_id"]]
+                    if not logs:
+                        raise ValueError("Unknown job_id in evidence snapshot")
+                if args.get("line_start") is not None or args.get("line_end") is not None:
+                    start = args.get("line_start") if args.get("line_start") is not None else 1
+                    end = args.get("line_end") if args.get("line_end") is not None else start + 79
+                    if not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start:
+                        raise ValueError("Invalid log line range")
+                    end = min(end, start + 79)
+                    return {"ok": True, "tool": tool_name, "result": [
+                        {"job_id": log.job_id, "job_name": log.job_name,
+                         "numbered_text": "\n".join(f"{i + 1} | {line}" for i, line in
+                             enumerate(log.lines) if start <= i + 1 <= end)} for log in logs]}
                 return {
                     "ok": True,
                     "tool": tool_name,
@@ -514,7 +530,9 @@ Tool observations (the only detailed context you currently have):
 
             if tool_name == "get_commit_diff":
                 sha = str(args.get("sha") or evidence.sha).strip()
-                diff_text = self.tools.get_commit_diff(sha)
+                if sha != evidence.sha:
+                    raise ValueError("Only the current commit snapshot is available")
+                diff_text = evidence.diff
                 return {
                     "ok": True,
                     "tool": tool_name,
@@ -550,15 +568,7 @@ Tool observations (the only detailed context you currently have):
 
             if tool_name == "rerun_job":
                 run_id = self._normalize_run_id(args.get("run_id"), evidence.run_id)
-                accepted = self.tools.rerun_job(run_id)
-                return {
-                    "ok": True,
-                    "tool": tool_name,
-                    "result": {
-                        "run_id": run_id,
-                        "accepted": bool(accepted),
-                    },
-                }
+                raise ValueError("Reruns are executed only by the outer triage workflow")
 
             if tool_name == "search_playbook":
                 query = str(args.get("query") or self._build_tool_query(evidence)).strip()
@@ -838,245 +848,71 @@ Previous tool observations:
         }
 
     def _generate_controlled_agent_mode(
-        self,
-        evidence,
-        strict_grounding: bool,
-        rag_context: list[dict] | None,
-        checkpoint=None,
+        self, evidence, strict_grounding, rag_context, checkpoint=None,
+        repair_context=None,
     ) -> dict:
-        if self.tools is None:
-            return self._controlled_abstain_result(
-                summary=(
-                    "Controlled mode requires a configured toolbelt, "
-                    "but no tools are available."
-                ),
-                observations=[
-                    {
-                        "event": "controlled_mode_abstain",
-                        "reason": "toolbelt_not_configured",
-                    }
-                ],
-            )
-
-        strict_instruction = ""
-        if strict_grounding:
-            strict_instruction = """
-        IMPORTANT:
-        Your previous answer failed grounding verification.
-        You must gather log evidence and historical evidence through tools before final output.
-        Cite only exact text copied from numbered logs.
-        """
-
         state = checkpoint.state if checkpoint else {}
+        started = time.monotonic()
+        elapsed = state.get("elapsed_seconds", 0.0)
+        if (state.get("pending") or {}).get("tool") == "rerun_job" and state.get("tool_started"):
+            raise ManualReviewRequired("Legacy rerun outcome requires manual reconciliation")
         observations = state.get("observations", [])
-        has_log_evidence = state.get("has_log_evidence", False)
-        has_rag_evidence = state.get("has_rag_evidence", False)
-        evidence_tool_calls = state.get("evidence_tool_calls", 0)
         tool_exchange = state.get("tool_exchange", [])
-
-        def save(turn, pending=None, tool_started=False):
-            if checkpoint:
-                checkpoint.save({
-                    "turn": turn, "observations": observations,
-                    "has_log_evidence": has_log_evidence,
-                    "has_rag_evidence": has_rag_evidence,
-                    "evidence_tool_calls": evidence_tool_calls,
-                    "tool_exchange": tool_exchange, "pending": pending,
-                    "tool_started": tool_started,
-                })
-
         pending = state.get("pending")
-        if pending and state.get("tool_started") and pending.get("tool") == "rerun_job":
-            raise ManualReviewRequired(
-                f"Interrupted rerun_job has an uncertain outcome; manual reconciliation required "
-                f"for task {checkpoint.execution.key if checkpoint else 'unknown'}")
-        for turn in range(state.get("turn", 0), self.max_reasoning_turns):
-            observations_raw = "None"
-            if observations:
-                observations_raw = json.dumps(
-                    observations,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+        logs, _ = self._format_logs(evidence.logs)
+        logs, _ = self._truncate_text(logs, self.LOGS_BUDGET_CHARS)
+        diff, _ = self._truncate_text(evidence.diff, self.DIFF_BUDGET_CHARS)
+        history, _ = self._truncate_text(self._format_rag_context(rag_context), self.RAG_BUDGET_CHARS)
+        snapshot = f"\nSanitized evidence snapshot (original log line numbers):\n{logs}\nCommit diff:\n{diff}\nHistorical reference:\n{history}"
+        repair = ""
+        if strict_grounding:
+            repair = "Correct the previous RCA using the same evidence. Fix the validation errors; do not repeat investigation unnecessarily."
+            if repair_context:
+                details, _ = self._truncate_text(json.dumps(repair_context, ensure_ascii=False), self.OBSERVATIONS_BUDGET_CHARS)
+                repair += "\n" + details
 
-            observations_text, observations_truncated = self._truncate_text(
-                observations_raw,
-                self.OBSERVATIONS_BUDGET_CHARS,
-            )
+        def save(turn, pending=None):
+            if checkpoint:
+                checkpoint.save({"turn": turn, "observations": observations,
+                    "tool_exchange": tool_exchange, "pending": pending, "tool_started": False,
+                    "elapsed_seconds": elapsed + time.monotonic() - started})
 
+        # Reserve a separate final-only turn after the investigation budget.
+        for turn in range(state.get("turn", 0), self.max_reasoning_turns + 1):
+            observation_text, clipped = self._truncate_text(
+                json.dumps(observations, ensure_ascii=False), self.OBSERVATIONS_BUDGET_CHARS)
             prompt = self._build_controlled_loop_prompt(
-                evidence=evidence,
-                strict_instruction=strict_instruction,
-                observations_text=observations_text,
-                observations_truncated=observations_truncated,
-                has_log_evidence=has_log_evidence,
-                has_rag_evidence=has_rag_evidence,
-                evidence_tool_calls=evidence_tool_calls,
-            )
-
+                evidence=evidence, strict_instruction=repair,
+                observations_text=observation_text, observations_truncated=clipped,
+                has_log_evidence=bool(evidence.logs), has_rag_evidence=bool(rag_context),
+                evidence_tool_calls=len(observations)) + snapshot
+            final_only = (turn == self.max_reasoning_turns or
+                          elapsed + time.monotonic() - started >= self.MAX_INVESTIGATION_SECONDS)
+            if final_only:
+                prompt += "\nInvestigation budget exhausted. Return final RCA or abstain now. No further tools."
             if pending is not None:
-                payload = pending
-                pending = None
+                payload, pending = pending, None
             else:
-                payload, tool_exchange = self._request_action(prompt, tool_exchange)
-                save(turn, pending=payload)
-
-            # Backward compatibility: direct RCA payload is treated as final action.
-            if self._is_rca_payload(payload):
-                if self._has_required_evidence(
-                    has_log_evidence=has_log_evidence,
-                    has_rag_evidence=has_rag_evidence,
-                    evidence_tool_calls=evidence_tool_calls,
-                ):
-                    return self._with_reasoning_trace(payload, observations)
-
-                observations.append(
-                    {
-                        "event": "final_blocked",
-                        "reason": "missing_required_evidence",
-                        "required": {
-                            "has_log_evidence": True,
-                            "has_rag_evidence": True,
-                            "evidence_tool_calls_min": 1,
-                        },
-                        "current": {
-                            "has_log_evidence": has_log_evidence,
-                            "has_rag_evidence": has_rag_evidence,
-                            "evidence_tool_calls": evidence_tool_calls,
-                        },
-                    }
-                )
-                save(turn + 1)
-                continue
-
-            action = payload.get("action")
-            if action == "final" and self._is_rca_payload(payload.get("rca")):
-                if self._has_required_evidence(
-                    has_log_evidence=has_log_evidence,
-                    has_rag_evidence=has_rag_evidence,
-                    evidence_tool_calls=evidence_tool_calls,
-                ):
-                    return self._with_reasoning_trace(payload["rca"], observations)
-
-                observations.append(
-                    {
-                        "event": "final_blocked",
-                        "reason": "missing_required_evidence",
-                        "required": {
-                            "has_log_evidence": True,
-                            "has_rag_evidence": True,
-                            "evidence_tool_calls_min": 1,
-                        },
-                        "current": {
-                            "has_log_evidence": has_log_evidence,
-                            "has_rag_evidence": has_rag_evidence,
-                            "evidence_tool_calls": evidence_tool_calls,
-                        },
-                    }
-                )
-                save(turn + 1)
-                continue
-
-            if action != "tool_call":
-                observations.append(
-                    {
-                        "event": "controlled_mode_abstain",
-                        "reason": f"invalid_action:{action}",
-                    }
-                )
+                payload, tool_exchange = self._request_action(prompt, tool_exchange, final_only=final_only)
+                save(turn, payload)
+            rca = payload if self._is_rca_payload(payload) else payload.get("rca")
+            if isinstance(rca, dict) and self._is_rca_payload(rca):
+                return self._with_reasoning_trace(rca, observations)
+            if final_only or payload.get("action") != "tool_call":
                 return self._controlled_abstain_result(
-                    summary=(
-                        "Controlled mode received an invalid model action "
-                        "before evidence requirements were met."
-                    ),
-                    observations=observations,
-                )
-
-            tool_name = payload.get("tool")
-            if tool_name == "get_failed_logs":
-                # In controlled mode, logs must come from the current failing run.
-                # Ignore model-provided run IDs to avoid cross-run contamination.
-                payload = {
-                    **payload,
-                    "args": {
-                        **(payload.get("args") or {}),
-                        "run_id": evidence.run_id,
-                    },
-                }
-            save(turn, pending=payload, tool_started=True)
-            if checkpoint and tool_name == "get_failed_logs":
-                tool_result = {"ok": True, "tool": tool_name,
-                               "result": self._serialize_raw_logs(evidence.logs)}
-            else:
-                tool_result = self._execute_tool_call(evidence, payload)
-            if checkpoint and not tool_result.get("ok"):
-                error = tool_result.get("error", "Tool failed")
-                if tool_name == "rerun_job":
-                    raise ManualReviewRequired(error)
-                raise RuntimeError(error)
-            tool_exchange.append(self._tool_output(payload, tool_result))
-            observations.append(
-                {
-                    "tool_request": {
-                        "tool": tool_name,
-                        "args": payload.get("args") or {},
-                        "reason": payload.get("reason", ""),
-                    },
-                    "tool_result": tool_result,
-                }
-            )
-
-            if self._is_evidence_tool(tool_name):
-                evidence_tool_calls += 1
-
-            if not tool_result.get("ok"):
-                observations.append(
-                    {
-                        "event": "controlled_mode_abstain",
-                        "reason": "tool_call_failed",
-                    }
-                )
-                return self._controlled_abstain_result(
-                    summary=(
-                        "Controlled mode stopped because a required tool call failed."
-                    ),
-                    observations=observations,
-                )
-
-            if tool_name == "get_failed_logs":
-                log_rows = tool_result.get("result") or []
-                if isinstance(log_rows, list):
-                    # A successful log fetch attempt satisfies the evidence step,
-                    # even when no failed logs are returned.
-                    has_log_evidence = True
-
-            if tool_name == "search_playbook":
-                chunks = (tool_result.get("result") or {}).get("chunks") or []
-                if isinstance(chunks, list):
-                    # Historical retrieval can legitimately return zero matches.
-                    # Treating this as "missing evidence" causes avoidable abstains.
-                    has_rag_evidence = True
-
+                    summary="No valid final RCA within the investigation budget.", observations=observations)
+            result = self._execute_tool_call(evidence, payload)
+            tool_exchange.append(self._tool_output(payload, result))
+            observations.append({"tool_request": {"tool": payload.get("tool"),
+                "args": payload.get("args") or {}, "reason": payload.get("reason", "")},
+                "tool_result": result})
+            # Optional investigation failures are observations, not automatic abstentions.
             save(turn + 1)
-
-        observations.append(
-            {
-                "event": "controlled_mode_abstain",
-                "reason": "max_turns_exceeded",
-                "max_reasoning_turns": self.max_reasoning_turns,
-            }
-        )
-        return self._controlled_abstain_result(
-            summary=(
-                "Controlled mode reached the maximum reasoning turns "
-                "before satisfying evidence requirements."
-            ),
-            observations=observations,
-        )
+        return self._controlled_abstain_result(summary="Investigation budget exhausted.", observations=observations)
 
     def generate(
         self, evidence, rag_context: list[dict] | None = None,
-        strict_grounding: bool = False, checkpoint=None,
+        strict_grounding: bool = False, checkpoint=None, repair_context=None,
     ) -> dict:
         try:
             if getattr(self, "controlled_agent_mode", False):
@@ -1084,7 +920,7 @@ Previous tool observations:
                     return checkpoint.result
                 result = self._generate_controlled_agent_mode(
                     evidence=evidence, strict_grounding=strict_grounding,
-                    rag_context=rag_context, checkpoint=checkpoint)
+                    rag_context=rag_context, checkpoint=checkpoint, repair_context=repair_context)
                 if checkpoint:
                     checkpoint.complete(result)
                 return result

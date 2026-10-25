@@ -55,6 +55,46 @@ class DurableTests(unittest.TestCase):
         self.service.github_delivery.deliver.return_value = {"html_url": "https://example.test/comment"}
         self.service.slack_client.send_message.return_value = {"ok": True, "ts": "123"}
 
+    def test_abstention_is_saved_but_not_indexed_or_prefetched(self):
+        self.service.rag_store = Mock()
+        self.service.confidence_gate.evaluate.return_value = SimpleNamespace(decision="abstain", reason="uncertain")
+        key = self.queue.enqueue(self.job)
+        result = process_task(self.service, self.queue.claim())
+        incident = self.service.incident_store.get_by_id(result.incident_id)
+        self.assertEqual(incident.action, "abstain")
+        self.assertTrue(incident.abstained)
+        self.assertEqual(incident.failure_class, "unknown")
+        self.service.rag_store.retrieve_for_evidence.assert_not_called()
+        self.service.rag_store.prepare_incident.assert_not_called()
+
+    def test_confirmed_rerun_indexes_final_rca_and_retains_feedback(self):
+        RagChunk.__table__.create(self.engine)
+        store = RagStore(self.factory)
+        store._build_embedding = Mock(side_effect=RuntimeError("offline"))
+        self.service.rag_store = store
+        self.service.confidence_gate.evaluate.return_value = SimpleNamespace(decision="rerun", reason="suspected")
+        self.service.github_client.get_workflow_run.return_value = {"run_attempt": 1}
+        self.service.github_client.rerun_failed_jobs.return_value = True
+        self.service.github_client.wait_for_new_attempt_completion.return_value = {"conclusion": "success"}
+        self.service.rca_pipeline.verifier.verify.return_value = True
+        self.queue.enqueue(self.job)
+        result = process_task(self.service, self.queue.claim())
+        incident = self.service.incident_store.get_by_id(result.incident_id)
+        self.assertEqual(incident.failure_class, "flaky")
+        self.assertEqual(incident.action, "delivered")
+        with self.factory() as session:
+            chunk = session.scalars(select(RagChunk)).one()
+            self.assertIn("class=flaky", chunk.text)
+            self.assertIn("action=delivered", chunk.text)
+            chunk.quality_score = 1.0
+            session.commit()
+        incident.summary = "updated final summary"
+        store.index_incident(incident)
+        with self.factory() as session:
+            chunk = session.scalars(select(RagChunk)).one()
+            self.assertIn("updated final summary", chunk.text)
+            self.assertEqual(chunk.quality_score, 1.0)
+
     def tearDown(self):
         self.engine.dispose()
         self.temp.cleanup()
@@ -230,7 +270,7 @@ class DurableTests(unittest.TestCase):
         key = self.queue.enqueue(self.job)
         with self.assertRaises(Crash):
             process_task(self.service, self.queue.claim())
-        self.assertTrue(self.queue.inspect(key)["agent_state"]["normal"]["state"]["has_log_evidence"])
+        self.assertEqual(self.queue.inspect(key)["agent_state"]["normal"]["state"]["observations"][0]["tool_result"]["result"][0]["job_id"], 1)
         self.queue.recover_running()
         reasoner.tools.search_playbook.return_value = []
         reasoner._request_action = Mock(side_effect=[({"action": "tool_call",

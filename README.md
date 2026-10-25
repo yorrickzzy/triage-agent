@@ -216,6 +216,35 @@ Some scripts are integration or manual delivery checks and can call live GitHub,
 
 ## Replay Evaluation
 
+### Evidence-first agent workflow
+
+The worker collects and sanitizes logs and the commit diff once. The durable
+`evidence` checkpoint is the snapshot used both by the model and citation
+validation. The model initially sees numbered error windows and a bounded diff.
+`get_failed_logs` reads that snapshot (optionally by `job_id`, `line_start`, and
+`line_end`, up to 80 lines); `get_commit_diff` reads the same saved commit. Neither
+tool downloads these inputs again, and requests for another run/commit are rejected.
+
+The default controlled agent no longer prefetches RAG or requires tool calls before
+answering. It searches history only when helpful, using concrete errors and module
+names. Empty results and optional tool failures are observations, not automatic
+abstentions. Four investigation turns are followed, if necessary, by a final-only
+turn. A 120-second investigation budget is checked between turns (not a hard
+wall-clock deadline for in-flight requests); model requests have a 30-second
+timeout and one retry. Existing durable checkpoints preserve completed tool work.
+
+Non-abstained model conclusions require cited claims. Invalid citations trigger
+one repair pass supplied with the previous RCA and specific validation errors.
+Citation matching verifies provenance, not semantic correctness. Only the outer
+triage workflow can execute reruns; the agent can recommend suspected flakiness.
+
+After delivery/rerun decisions, the Incident is updated with the final RCA.
+Only delivered, non-abstained conclusions are newly indexed in RAG. Abstentions
+and unsuccessful tasks remain audit records. Reindexing a case refreshes its text
+while preserving feedback, and negatively scored cases are excluded from retrieval.
+Previously indexed cases are not bulk-deleted by this change. No schema migration
+is required. The legacy non-controlled mode is retained for compatibility.
+
 The replay harness evaluates saved evidence snapshots without fetching live GitHub data. It reports classification accuracy, abstention accuracy, grounding pass rate, per-class accuracy, and the decision breakdown.
 
 ```bash

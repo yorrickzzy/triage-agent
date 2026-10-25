@@ -46,7 +46,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         schemas = reasoner._function_tools()
         self.assertEqual({tool["name"] for tool in schemas}, {
             "get_failed_logs", "get_commit_diff", "get_last_green_run",
-            "rerun_job", "search_playbook",
+            "search_playbook",
         })
         for tool in schemas:
             self.assertTrue(tool["strict"])
@@ -86,25 +86,22 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         self.assertIn("[truncated]", output["output"])
         self.assertLess(len(output["output"]), 110)
 
-    def test_controlled_native_tool_failure_still_abstains(self):
+    def test_optional_tool_failure_can_still_produce_final(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
-        reasoner.client = Mock()
-        reasoner.tools = Mock()
-        reasoner.controlled_agent_mode = True
-        reasoner.max_reasoning_turns = 4
-        reasoner.client.responses.create.return_value = function_response(
-            "get_failed_logs", {"run_id": None, "reason": "need logs"}
-        )
-        reasoner.tools.get_failed_logs.side_effect = RuntimeError("log fetch failed")
-        evidence = SimpleNamespace(
-            run_id=123, workflow_name="ci", branch="main", sha="abc",
-            failed_jobs=["tests"], last_green_run_id=None,
-        )
+        reasoner.client, reasoner.tools = Mock(), Mock()
+        reasoner.controlled_agent_mode, reasoner.max_reasoning_turns = True, 1
+        reasoner.tools.search_playbook.side_effect = RuntimeError("unavailable")
+        final = {"failure_class": "test", "summary": "snapshot sufficient", "claims": [],
+                 "suggested_next_step": "fix", "confidence": .9, "abstained": False}
+        reasoner.client.responses.create.side_effect = [
+            function_response("search_playbook", {"query": "AssertionError"}),
+            SimpleNamespace(output=[], output_text=json.dumps(final))]
+        evidence = SimpleNamespace(run_id=123, workflow_name="ci", branch="main", sha="abc",
+            failed_jobs=["tests"], last_green_run_id=None, diff="", logs=[])
         result = reasoner.generate(evidence)
-        self.assertTrue(result["abstained"])
-        self.assertEqual(result["reasoning_trace"][-1]["reason"], "tool_call_failed")
-        reasoner.tools.get_failed_logs.assert_called_once_with(123)
-        self.assertEqual(reasoner.client.responses.create.call_count, 1)
+        self.assertFalse(result["abstained"])
+        self.assertFalse(result["reasoning_trace"][0]["tool_result"]["ok"])
+        self.assertEqual(reasoner.client.responses.create.call_args.kwargs["tool_choice"], "none")
 
     def test_generate_returns_fallback_when_request_times_out(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
@@ -254,81 +251,22 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         self.assertEqual(output["call_id"], call.call_id)
         self.assertEqual(json.loads(output["output"])["result"]["query"], "pytest assertion")
 
-    def test_controlled_mode_requires_log_and_rag_evidence_before_final(self):
+    def test_snapshot_can_produce_final_without_mandatory_tools(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
-        reasoner.client = Mock()
-        reasoner.tools = Mock()
-        reasoner.controlled_agent_mode = True
-        reasoner.max_reasoning_turns = 4
-        reasoner.OBSERVATIONS_BUDGET_CHARS = 4000
-
-        reasoner.tools.get_failed_logs.return_value = [
-            RawLog(
-                job_id=10,
-                job_name="unit-tests",
-                text="AssertionError: expected 30 got 45",
-                lines=["AssertionError: expected 30 got 45"],
-            )
-        ]
-        reasoner.tools.search_playbook.return_value = [
-            {
-                "source_type": "incident",
-                "source_id": 101,
-                "workflow_name": "ci",
-                "failure_class": "test",
-                "quality_score": 1.0,
-                "text": "historical pytest mismatch",
-            }
-        ]
-
-        reasoner.client.responses.create.side_effect = [
-            SimpleNamespace(
-                output=[], output_text=(
-                    '{"action":"final","rca":'
-                    '{"failure_class":"test","summary":"early",'
-                    '"claims":[],"suggested_next_step":"n",'
-                    '"confidence":0.9,"abstained":false}}'
-                )
-            ),
-            function_response('get_failed_logs', {'reason': 'need raw evidence'}),
-            function_response('search_playbook', {'query': 'ci unit-tests', 'limit': 5, 'reason': 'need historical context'}),
-            SimpleNamespace(
-                output=[], output_text=(
-                    '{"action":"final","rca":'
-                    '{"failure_class":"test","summary":"grounded",'
-                    '"claims":[],"suggested_next_step":"fix test",'
-                    '"confidence":0.92,"abstained":false}}'
-                )
-            ),
-        ]
-
-        evidence = SimpleNamespace(
-            run_id=123,
-            workflow_name="ci",
-            branch="main",
-            sha="abc123",
-            failed_jobs=["unit-tests"],
-            last_green_run_id=12,
-            diff="",
-            logs=[],
-        )
-
-        result = reasoner.generate(evidence)
-
-        self.assertEqual(result["summary"], "grounded")
-        self.assertEqual(reasoner.tools.get_failed_logs.call_count, 1)
-        self.assertEqual(reasoner.tools.search_playbook.call_count, 1)
-        trace = result["reasoning_trace"]
-        self.assertEqual(trace[0].get("event"), "final_blocked")
-        self.assertEqual(trace[1]["tool_request"]["tool"], "get_failed_logs")
-        self.assertEqual(trace[2]["tool_request"]["tool"], "search_playbook")
-        self.assertEqual(trace[1]["tool_request"]["reason"], "need raw evidence")
-        requests = reasoner.client.responses.create.call_args_list
-        for request, expected_tool in zip(requests[2:], ["get_failed_logs", "search_playbook"]):
-            items = request.kwargs["input"]
-            self.assertEqual(items[2].name, expected_tool)
-            self.assertEqual(items[3]["call_id"], items[2].call_id)
-            self.assertEqual(json.loads(items[3]["output"])["tool"], expected_tool)
+        reasoner.client, reasoner.tools = Mock(), Mock()
+        reasoner.controlled_agent_mode, reasoner.max_reasoning_turns = True, 4
+        final = {"failure_class": "test", "summary": "grounded", "claims": [],
+                 "suggested_next_step": "fix", "confidence": .9, "abstained": False}
+        reasoner.client.responses.create.return_value = SimpleNamespace(output=[], output_text=json.dumps(final))
+        evidence = SimpleNamespace(run_id=123, workflow_name="ci", branch="main", sha="abc",
+            failed_jobs=["tests"], last_green_run_id=None, diff="sanitized diff",
+            logs=[RawLog(1, "tests", "AssertionError [REDACTED]", ["AssertionError [REDACTED]"])])
+        self.assertEqual(reasoner.generate(evidence)["summary"], "grounded")
+        reasoner.tools.get_failed_logs.assert_not_called()
+        reasoner.tools.search_playbook.assert_not_called()
+        prompt = reasoner.client.responses.create.call_args.kwargs["input"]
+        self.assertIn("1 | AssertionError [REDACTED]", prompt)
+        self.assertIn("sanitized diff", prompt)
 
     def test_execute_tool_call_routes_all_documented_tools(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
@@ -366,7 +304,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
             failed_jobs=["lint"],
             last_green_run_id=12,
             diff="",
-            logs=[],
+            logs=[RawLog(10, "lint", "line1\nline2", ["line1", "line2"])],
         )
 
         failed_logs_result = reasoner._execute_tool_call(
@@ -376,7 +314,7 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         self.assertTrue(failed_logs_result["ok"])
         self.assertEqual(failed_logs_result["tool"], "get_failed_logs")
         self.assertEqual(failed_logs_result["result"][0]["job_id"], 10)
-        reasoner.tools.get_failed_logs.assert_called_once_with(123)
+        reasoner.tools.get_failed_logs.assert_not_called()
 
         diff_result = reasoner._execute_tool_call(
             evidence,
@@ -384,7 +322,8 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         )
         self.assertTrue(diff_result["ok"])
         self.assertEqual(diff_result["result"]["sha"], "abc123")
-        reasoner.tools.get_commit_diff.assert_called_once_with("abc123")
+        reasoner.tools.get_commit_diff.assert_not_called()
+        self.assertEqual(diff_result["result"]["diff"], evidence.diff)
 
         green_result = reasoner._execute_tool_call(
             evidence,
@@ -402,9 +341,8 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
             evidence,
             {"tool": "rerun_job", "args": {}},
         )
-        self.assertTrue(rerun_result["ok"])
-        self.assertTrue(rerun_result["result"]["accepted"])
-        reasoner.tools.rerun_job.assert_called_once_with(123)
+        self.assertFalse(rerun_result["ok"])
+        reasoner.tools.rerun_job.assert_not_called()
 
         playbook_result = reasoner._execute_tool_call(
             evidence,
@@ -461,44 +399,18 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         self.assertIn("logs_truncated: true", prompt)
         self.assertIn("diff_truncated: true", prompt)
 
-    def test_controlled_mode_abstains_after_turn_limit_without_workflow_fallback(self):
+    def test_final_only_turn_rejects_additional_tool_calls(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
-        reasoner.client = Mock()
-        reasoner.tools = Mock()
-        reasoner.controlled_agent_mode = True
-        reasoner.max_reasoning_turns = 1
-        reasoner.OBSERVATIONS_BUDGET_CHARS = 4000
-
-        reasoner.client.responses.create.return_value = SimpleNamespace(
-            output=[], output_text=(
-                '{"action":"final","rca":'
-                '{"failure_class":"test","summary":"early",'
-                '"claims":[],"suggested_next_step":"n",'
-                '"confidence":0.8,"abstained":false}}'
-            )
-        )
-
-        evidence = SimpleNamespace(
-            run_id=123,
-            workflow_name="ci",
-            branch="main",
-            sha="abc123",
-            failed_jobs=["unit-tests"],
-            last_green_run_id=12,
-            diff="",
-            logs=[],
-        )
-
-        result = reasoner.generate(evidence)
-
-        self.assertTrue(result["abstained"])
-        self.assertIn("maximum reasoning turns", result["summary"])
-        self.assertEqual(reasoner.client.responses.create.call_count, 1)
-        self.assertEqual(reasoner.tools.get_failed_logs.call_count, 0)
-        self.assertEqual(reasoner.tools.search_playbook.call_count, 0)
-        trace = result["reasoning_trace"]
-        self.assertEqual(trace[0].get("event"), "final_blocked")
-        self.assertEqual(trace[1].get("event"), "controlled_mode_abstain")
+        reasoner.client, reasoner.tools = Mock(), Mock()
+        reasoner.controlled_agent_mode, reasoner.max_reasoning_turns = True, 1
+        reasoner.tools.search_playbook.return_value = []
+        reasoner.client.responses.create.return_value = function_response("search_playbook", {"query": "error"})
+        evidence = SimpleNamespace(run_id=123, workflow_name="ci", branch="main", sha="abc",
+            failed_jobs=[], last_green_run_id=None, diff="", logs=[])
+        self.assertTrue(reasoner.generate(evidence)["abstained"])
+        self.assertEqual(reasoner.client.responses.create.call_count, 2)
+        reasoner.tools.search_playbook.assert_called_once()
+        self.assertEqual(reasoner.client.responses.create.call_args.kwargs["tool_choice"], "none")
 
     def test_controlled_mode_allows_final_when_playbook_returns_empty(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
@@ -546,10 +458,10 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
 
         self.assertFalse(result["abstained"])
         self.assertEqual(result["summary"], "grounded without rag hit")
-        self.assertEqual(reasoner.tools.get_failed_logs.call_count, 1)
+        self.assertEqual(reasoner.tools.get_failed_logs.call_count, 0)
         self.assertEqual(reasoner.tools.search_playbook.call_count, 1)
 
-    def test_controlled_mode_forces_current_run_id_for_get_failed_logs(self):
+    def test_controlled_mode_rejects_other_run_snapshot(self):
         reasoner = OpenAIReasoner.__new__(OpenAIReasoner)
         reasoner.client = Mock()
         reasoner.tools = Mock()
@@ -594,7 +506,8 @@ class OpenAIReasonerTimeoutTests(unittest.TestCase):
         result = reasoner.generate(evidence)
 
         self.assertFalse(result["abstained"])
-        reasoner.tools.get_failed_logs.assert_called_once_with(31307072970)
+        reasoner.tools.get_failed_logs.assert_not_called()
+        self.assertFalse(result["reasoning_trace"][0]["tool_result"]["ok"])
 
 
 if __name__ == "__main__":

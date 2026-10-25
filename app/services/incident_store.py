@@ -124,6 +124,8 @@ class IncidentStore:
         action: str,
         decision_reason: str,
         comment_url: str | None,
+        rca: dict | None = None,
+        fallback_trace=None,
     ) -> Incident:
         with self.session_factory() as session:
             incident = session.get(Incident, incident_id)
@@ -136,8 +138,21 @@ class IncidentStore:
             incident.action = action
             incident.decision_reason = decision_reason
             incident.comment_url = comment_url
+            if rca is not None:
+                self.apply_rca(incident, rca, fallback_trace=fallback_trace)
 
             session.commit()
             session.refresh(incident)
 
             return incident
+
+    @staticmethod
+    def apply_rca(incident, rca, fallback_trace=None):
+        incident.failure_class = rca.get("failure_class", "unknown")
+        incident.summary = rca.get("summary", "")
+        incident.suggested_next_step = rca.get("suggested_next_step", "")
+        incident.confidence = float(rca.get("confidence", 0.0))
+        incident.abstained = bool(rca.get("abstained", False))
+        trace = rca.get("reasoning_trace", fallback_trace)
+        if trace is not None:
+            incident.reasoning_trace = json.dumps(trace, ensure_ascii=False)

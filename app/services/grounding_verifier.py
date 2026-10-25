@@ -35,15 +35,28 @@ class GroundingVerifier:
         Returns:
             True if all citations are valid and grounded, False otherwise
         """
-        for claim in rca.get("claims", []):
+        return not self.validation_errors(rca, evidence)
+
+    def validation_errors(self, rca: dict, evidence) -> list[str]:
+        if rca.get("abstained") is True and not rca.get("claims"):
+            return []
+        claims = rca.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return ["A non-abstained RCA must include at least one claim with log citations"]
+        errors = []
+        for index, claim in enumerate(claims):
+            if not isinstance(claim, dict) or not isinstance(claim.get("citations"), list) or not claim["citations"]:
+                errors.append(f"Claim {index + 1} needs log citations")
+                continue
             for citation in claim.get("citations", []):
                 # First validate citation structure
-                if not self._validate_citation(citation):
+                if not isinstance(citation, dict) or not self._validate_citation(citation):
                     print(
                         f"[grounding] citation validation failed: {citation}",
                         flush=True,
                     )
-                    return False
+                    errors.append(f"Claim {index + 1}: citation must have valid line_start, line_end and nonempty quote")
+                    continue
 
                 # Try to find the citation in any log
                 found = False
@@ -57,9 +70,9 @@ class GroundingVerifier:
                         f"[grounding] citation not found in any log: {citation}",
                         flush=True,
                     )
-                    return False
+                    errors.append(f"Claim {index + 1}: quote does not match the snapshot at lines {citation['line_start']}..{citation['line_end']}")
 
-        return True
+        return errors
 
     def _validate_citation(self, citation: dict) -> bool:
         """Validate citation structure and types."""

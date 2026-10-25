@@ -83,6 +83,11 @@ class RagStore:
             RagChunk.source_type == "incident", RagChunk.source_id == payload["source_id"]
         )).first()
         if existing is not None:
+            # Refresh legacy/intermediate content, retaining reviewer feedback.
+            for key, value in payload.items():
+                if key != "quality_score":
+                    setattr(existing, key, value)
+            session.flush()
             return existing.id
         chunk = RagChunk(**payload)
         session.add(chunk)
@@ -199,6 +204,7 @@ class RagStore:
                   AND (:workflow_name IS NULL OR workflow_name = :workflow_name)
                   AND semantic_embedding IS NOT NULL
                   AND embedding_model = :embedding_model
+                  AND quality_score >= 0
                 ORDER BY semantic_embedding <-> CAST(:embedding AS vector({RAG_EMBEDDING_DIMENSIONS})) ASC,
                          quality_score DESC,
                          created_at DESC
@@ -246,6 +252,7 @@ class RagStore:
         keywords = self._build_query_terms(query)
 
         statement = select(RagChunk)
+        statement = statement.where(RagChunk.quality_score >= 0)
 
         if source_type is not None:
             statement = statement.where(RagChunk.source_type == source_type)

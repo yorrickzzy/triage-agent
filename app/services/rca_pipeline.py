@@ -58,6 +58,10 @@ class RCAPipeline:
                 evidence,
                 rag_context=rag_context,
                 strict_grounding=True,
+                **({"repair_context": {
+                    "previous_rca": first_rca,
+                    "validation_errors": self.verifier.validation_errors(first_rca, evidence),
+                }} if hasattr(self.verifier, "validation_errors") else {}),
                 **({"checkpoint": execution.checkpoint(strict=True)} if execution else {}),
             )
             set_span_attributes(

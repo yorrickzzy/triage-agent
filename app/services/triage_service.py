@@ -98,12 +98,7 @@ class TriageService:
                 return asdict(snapshot)
             snapshot = execution.step("evidence", collect)
             evidence = Evidence(**{**snapshot, "logs": [RawLog(**log) for log in snapshot["logs"]]})
-        rag_context = []
-        if self.rag_store is not None:
-            operation = lambda: self.rag_store.retrieve_for_evidence(evidence)
-            rag_context = execution.step("rag", operation) if execution else operation()
-
-        operation = lambda: self.rca_pipeline.run(evidence, rag_context=rag_context,
+        operation = lambda: self.rca_pipeline.run(evidence, rag_context=None,
             **({"execution": execution} if execution else {}))
         rca = execution.step("rca", operation) if execution else operation()
         if execution:
@@ -122,14 +117,7 @@ class TriageService:
         else:
             incident = self.incident_store.create_incident(evidence=evidence, rca=rca)
 
-        if self.rag_store is not None:
-            if execution:
-                payload = execution.step("incident_embedding", lambda: self.rag_store.prepare_incident(incident))
-                execution.step("index_incident", lambda session:
-                    self.rag_store.index_prepared_incident(session, payload), transactional=True)
-            else:
-                self.rag_store.index_incident(incident)
-
+        delivery_completed = False
         try:
             if gate_result.decision == "rerun":
                 result = self._probe_flakiness(
@@ -169,12 +157,25 @@ class TriageService:
                     row = session.get(Incident, incident.id)
                     row.action, row.decision_reason = result.action, result.reason
                     row.comment_url = result.comment_url
+                    self.incident_store.apply_rca(row, result.rca, fallback_trace=rca.get("reasoning_trace"))
                     return row.id
-                execution.step("incident_delivery", update_incident, transactional=True)
+                execution.step("incident_final_v2", update_incident, transactional=True)
             else:
                 self.incident_store.update_delivery(
                     incident_id=incident.id, action=result.action,
-                    decision_reason=result.reason, comment_url=result.comment_url)
+                    decision_reason=result.reason, comment_url=result.comment_url,
+                    rca=result.rca, fallback_trace=rca.get("reasoning_trace"))
+
+            delivery_completed = True
+            # Only final, delivered conclusions become reusable knowledge.
+            if self.rag_store is not None and result.action == "delivered" and not result.rca.get("abstained"):
+                final_incident = self.incident_store.get_by_id(incident.id)
+                if execution:
+                    payload = execution.step("final_embedding_v2", lambda: self.rag_store.prepare_incident(final_incident))
+                    execution.step("final_index_v2", lambda session:
+                        self.rag_store.index_prepared_incident(session, payload), transactional=True)
+                else:
+                    self.rag_store.index_incident(final_incident)
 
             result.incident_id = incident.id
             return result
@@ -182,6 +183,8 @@ class TriageService:
         except Exception as exc:
             if execution:
                 raise  # Task status records failures and review requirements.
+            if delivery_completed:
+                raise  # Indexing failures must not rewrite a successful delivery.
             self.incident_store.update_delivery(
                 incident_id=incident.id,
                 action="delivery_failed",
